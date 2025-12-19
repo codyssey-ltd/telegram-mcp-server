@@ -1,0 +1,21 @@
+version: "3.8"
+services:
+  telegram-mcp-server:
+    image: node:20-alpine
+    container_name: telegram-mcp-server
+    working_dir: /usr/src/app
+    volumes:
+      - ./:/usr/src/app:delegated
+      - node_modules:/usr/src/app/node_modules
+      - ./data:/usr/src/app/data
+    command: sh -c "npm install --no-audit --no-fund && npm start"
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+    restart: unless-stopped
+
+volumes:
+  node_modules:
