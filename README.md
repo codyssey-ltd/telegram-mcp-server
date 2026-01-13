@@ -12,9 +12,16 @@ An MCP server allowing AI assistants (like Claude or Cursor) to interact with yo
 | --- | --- |
 | `listChannels` | Lists available dialogs/channels (limit configurable). |
 | `searchChannels` | Searches dialogs by title or username. |
+| `listActiveChannels` | Lists dialogs tracked in the local archive registry. |
 | `getChannelMessages` | Fetches recent messages (ID or username, optional regex filter). |
+| `listChannelTopics` | Lists forum topics for a supergroup. |
+| `searchChannelTopics` | Searches forum topics by title. |
+| `getTopicMessages` | Fetches recent messages from a forum topic. |
 | `scheduleMessageSync` | Schedules a background job to archive a dialog into SQLite. |
 | `listMessageSyncJobs` | Displays tracked sync jobs, cursors, and statuses. |
+| `searchSyncedMessages` | Searches archived messages with a regex filter. |
+| `getSyncedMessageStats` | Returns summary statistics for archived messages. |
+| `getArchivedTopicMessages` | Fetches archived messages for a forum topic. |
 
 ## Prerequisites
 
@@ -91,15 +98,21 @@ There are two separate configurations that need to be set up:
 ## Background Message Sync
 
 - Jobs and archived messages are stored in `data/messages.db` (SQLite).
+- On startup the server seeds the archive registry from your dialog list and subscribes to realtime updates for all active chats.
 - The server processes sync jobs sequentially and waits between requests to avoid hitting Telegram rate limits.
 - Use the MCP tools to manage jobs:
 
   ```
-  scheduleMessageSync { "channelId": -1001234567890 }
+  scheduleMessageSync { "channelId": -1001234567890, "minDate": "2024-01-01T00:00:00Z" }
   listMessageSyncJobs {}
   ```
 
   You can supply either the numeric chat ID or the public username as `channelId`. Jobs resume automatically when the server restarts. Job statuses transition through `pending → in_progress → idle`, moving to `error` if retries are required.
+
+## Forum Topics
+
+- List or search topics with `listChannelTopics` and `searchChannelTopics`.
+- Fetch recent messages in a topic using `getTopicMessages` (online) or `getArchivedTopicMessages` (local archive).
 
 ## Troubleshooting
 

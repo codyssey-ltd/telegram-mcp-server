@@ -40,6 +40,9 @@ async function initializeTelegram() {
     throw new Error("Failed to initialize Telegram dialog list");
   }
 
+  const dialogCount = await messageSyncService.refreshChannelsFromDialogs();
+  console.log(`[startup] Seeded ${dialogCount} dialogs into archive registry.`);
+  messageSyncService.startRealtimeSync();
   messageSyncService.resumePendingJobs();
   telegramReady = true;
 }
@@ -89,6 +92,11 @@ const scheduleMessageSyncSchema = {
     .max(50000)
     .optional()
     .describe("Maximum messages to retain per channel (default 1000)"),
+  minDate: z
+    .string({ invalid_type_error: "minDate must be a string" })
+    .min(1)
+    .optional()
+    .describe("Earliest ISO-8601 timestamp to backfill (optional)"),
 };
 
 const searchSyncedMessagesSchema = {
@@ -113,6 +121,70 @@ const searchSyncedMessagesSchema = {
     .boolean({ invalid_type_error: "caseInsensitive must be a boolean" })
     .optional()
     .describe("Whether the pattern should be case-insensitive (default true)"),
+  topicId: z
+    .number({ invalid_type_error: "topicId must be a number" })
+    .int()
+    .positive()
+    .optional()
+    .describe("Optional forum topic ID to constrain the search"),
+};
+
+const listChannelTopicsSchema = {
+  channelId: z
+    .union([
+      z.number({ invalid_type_error: "channelId must be a number" }),
+      z.string({ invalid_type_error: "channelId must be a string" }).min(1),
+    ])
+    .describe("Numeric channel ID or username"),
+  limit: z.number().int().positive().optional().describe("Maximum number of topics to return (default: 100)"),
+};
+
+const searchChannelTopicsSchema = {
+  channelId: z
+    .union([
+      z.number({ invalid_type_error: "channelId must be a number" }),
+      z.string({ invalid_type_error: "channelId must be a string" }).min(1),
+    ])
+    .describe("Numeric channel ID or username"),
+  query: z
+    .string({ invalid_type_error: "query must be a string" })
+    .min(1)
+    .describe("Search query for forum topic titles"),
+  limit: z.number().int().positive().optional().describe("Maximum number of topics to return (default: 100)"),
+};
+
+const getTopicMessagesSchema = {
+  channelId: z
+    .union([
+      z.number({ invalid_type_error: "channelId must be a number" }),
+      z.string({ invalid_type_error: "channelId must be a string" }).min(1),
+    ])
+    .describe("Numeric channel ID or username"),
+  topicId: z
+    .number({ invalid_type_error: "topicId must be a number" })
+    .int()
+    .positive()
+    .describe("Forum topic ID"),
+  limit: z.number().int().positive().optional().describe("Maximum number of messages to return (default: 50)"),
+  filterPattern: z
+    .string()
+    .optional()
+    .describe("Optional regex to filter message content"),
+};
+
+const getArchivedTopicMessagesSchema = {
+  channelId: z
+    .union([
+      z.number({ invalid_type_error: "channelId must be a number" }),
+      z.string({ invalid_type_error: "channelId must be a string" }).min(1),
+    ])
+    .describe("Numeric channel ID or username"),
+  topicId: z
+    .number({ invalid_type_error: "topicId must be a number" })
+    .int()
+    .positive()
+    .describe("Forum topic ID"),
+  limit: z.number().int().positive().optional().describe("Maximum number of messages to return (default: 50)"),
 };
 
 function createServerInstance() {
@@ -160,6 +232,24 @@ function createServerInstance() {
   );
 
   server.tool(
+    "listActiveChannels",
+    "Lists dialogs tracked in the local archive registry.",
+    {},
+    async () => {
+      const channels = messageSyncService.listActiveChannels();
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(channels, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
     "getChannelMessages",
     "Retrieves recent messages for a channel by numeric ID or username.",
     getChannelMessagesSchema,
@@ -176,6 +266,7 @@ function createServerInstance() {
         date: msg.date ? new Date(msg.date * 1000).toISOString() : "unknown",
         text: msg.text ?? msg.message ?? "",
         from_id: msg.from_id ?? "unknown",
+        topic_id: msg.topic_id ?? null,
       }));
 
       if (filterPattern) {
@@ -208,12 +299,147 @@ function createServerInstance() {
   );
 
   server.tool(
+    "listChannelTopics",
+    "Lists forum topics for a supergroup.",
+    listChannelTopicsSchema,
+    async ({ channelId, limit }) => {
+      await telegramClient.ensureLogin();
+      const topics = await telegramClient.listForumTopics(channelId, { limit: limit ?? 100 });
+
+      const formatted = topics.map((topic) => {
+        let lastMessage = null;
+        try {
+          const msg = topic.lastMessage;
+          lastMessage = {
+            id: msg.id,
+            date: msg.date ? msg.date.toISOString() : null,
+            text: msg.text ?? msg.message ?? "",
+          };
+        } catch (error) {
+          lastMessage = null;
+        }
+
+        return {
+          id: topic.id,
+          title: topic.title,
+          date: topic.date ? topic.date.toISOString() : null,
+          isClosed: topic.isClosed,
+          isPinned: topic.isPinned,
+          unreadCount: topic.unreadCount,
+          lastMessage,
+        };
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                total: topics.total ?? formatted.length,
+                returned: formatted.length,
+                topics: formatted,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
+    "searchChannelTopics",
+    "Searches forum topics by title.",
+    searchChannelTopicsSchema,
+    async ({ channelId, query, limit }) => {
+      await telegramClient.ensureLogin();
+      const topics = await telegramClient.listForumTopics(channelId, { query, limit: limit ?? 100 });
+
+      const formatted = topics.map((topic) => ({
+        id: topic.id,
+        title: topic.title,
+        date: topic.date ? topic.date.toISOString() : null,
+        isClosed: topic.isClosed,
+        isPinned: topic.isPinned,
+        unreadCount: topic.unreadCount,
+      }));
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                total: topics.total ?? formatted.length,
+                returned: formatted.length,
+                topics: formatted,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
+    "getTopicMessages",
+    "Retrieves recent messages for a forum topic by topic ID.",
+    getTopicMessagesSchema,
+    async ({ channelId, topicId, limit, filterPattern }) => {
+      await telegramClient.ensureLogin();
+      const { messages, total } = await telegramClient.getTopicMessages(
+        channelId,
+        topicId,
+        limit ?? 50,
+      );
+
+      let formatted = messages.map((msg) => ({
+        id: msg.id,
+        date: msg.date ? new Date(msg.date * 1000).toISOString() : "unknown",
+        text: msg.text ?? msg.message ?? "",
+        from_id: msg.from_id ?? "unknown",
+        topic_id: msg.topic_id ?? null,
+      }));
+
+      if (filterPattern) {
+        try {
+          const regex = new RegExp(filterPattern);
+          formatted = formatted.filter((msg) => msg.text && regex.test(msg.text));
+        } catch (error) {
+          throw new Error(`Invalid filterPattern: ${error.message}`);
+        }
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                total,
+                returned: formatted.length,
+                messages: formatted,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
     "scheduleMessageSync",
     "Schedules a background job to archive channel messages locally.",
     scheduleMessageSyncSchema,
-    async ({ channelId, depth }) => {
+    async ({ channelId, depth, minDate }) => {
       await telegramClient.ensureLogin();
-      const job = messageSyncService.addJob(channelId, { depth });
+      const job = messageSyncService.addJob(channelId, { depth, minDate });
       void messageSyncService.processQueue();
 
       return {
@@ -231,12 +457,35 @@ function createServerInstance() {
     "searchSyncedMessages",
     "Searches stored messages for a channel using a regular expression.",
     searchSyncedMessagesSchema,
-    async ({ channelId, pattern, limit, caseInsensitive }) => {
+    async ({ channelId, pattern, limit, caseInsensitive, topicId }) => {
       const results = messageSyncService.searchMessages({
         channelId,
+        topicId,
         pattern,
         limit,
         caseInsensitive,
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(results, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
+    "getArchivedTopicMessages",
+    "Returns stored messages for a forum topic from the local archive.",
+    getArchivedTopicMessagesSchema,
+    async ({ channelId, topicId, limit }) => {
+      const results = messageSyncService.getArchivedMessages({
+        channelId,
+        topicId,
+        limit: limit ?? 50,
       });
 
       return {

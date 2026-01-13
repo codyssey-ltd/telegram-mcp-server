@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import { setTimeout as delay } from 'timers/promises';
+import { Message, PeersIndex } from '@mtcute/core';
 import { normalizeChannelId } from './telegram-client.js';
 
 const DEFAULT_DB_PATH = './data/messages.db';
@@ -13,6 +14,33 @@ const JOB_STATUS = {
   ERROR: 'error',
 };
 
+function normalizeChannelKey(channelId) {
+  return String(normalizeChannelId(channelId));
+}
+
+function normalizePeerType(peer) {
+  if (!peer) return 'chat';
+  if (peer.type === 'user' || peer.type === 'bot') return 'user';
+  if (peer.type === 'channel') return 'channel';
+  if (peer.type === 'chat' && peer.chatType && peer.chatType !== 'group') return 'channel';
+  return 'chat';
+}
+
+function parseIsoDate(value) {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  const ts = date.getTime();
+  if (Number.isNaN(ts)) {
+    throw new Error('minDate must be a valid ISO-8601 string');
+  }
+  return Math.floor(ts / 1000);
+}
+
+function toIsoString(dateSeconds) {
+  if (!dateSeconds) return null;
+  return new Date(dateSeconds * 1000).toISOString();
+}
+
 export default class MessageSyncService {
   constructor(telegramClient, options = {}) {
     this.telegramClient = telegramClient;
@@ -22,6 +50,9 @@ export default class MessageSyncService {
     this.interBatchDelayMs = options.interBatchDelayMs || 1000;
     this.processing = false;
     this.stopRequested = false;
+    this.realtimeActive = false;
+    this.realtimeHandlers = null;
+    this.unsubscribeChannelTooLong = null;
 
     this._initDatabase();
   }
@@ -36,16 +67,30 @@ export default class MessageSyncService {
     this.db.pragma('journal_mode = WAL');
 
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS channels (
+        channel_id TEXT PRIMARY KEY,
+        peer_title TEXT,
+        peer_type TEXT,
+        username TEXT,
+        sync_enabled INTEGER NOT NULL DEFAULT 1,
+        last_message_id INTEGER DEFAULT 0,
+        last_message_date TEXT,
+        oldest_message_id INTEGER,
+        oldest_message_date TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    this.db.exec(`
       CREATE TABLE IF NOT EXISTS jobs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         channel_id TEXT NOT NULL UNIQUE,
-        peer_title TEXT,
-        peer_type TEXT,
         status TEXT NOT NULL DEFAULT '${JOB_STATUS.PENDING}',
-        last_message_id INTEGER DEFAULT 0,
-        oldest_message_id INTEGER,
         target_message_count INTEGER DEFAULT ${DEFAULT_TARGET_MESSAGES},
         message_count INTEGER DEFAULT 0,
+        cursor_message_id INTEGER,
+        backfill_min_date TEXT,
         last_synced_at TEXT,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -53,15 +98,17 @@ export default class MessageSyncService {
       );
     `);
 
-    this._ensureJobColumn('oldest_message_id', 'INTEGER');
     this._ensureJobColumn('target_message_count', `INTEGER DEFAULT ${DEFAULT_TARGET_MESSAGES}`);
     this._ensureJobColumn('message_count', 'INTEGER DEFAULT 0');
+    this._ensureJobColumn('cursor_message_id', 'INTEGER');
+    this._ensureJobColumn('backfill_min_date', 'TEXT');
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         channel_id TEXT NOT NULL,
         message_id INTEGER NOT NULL,
+        topic_id INTEGER,
         date INTEGER,
         from_id TEXT,
         text TEXT,
@@ -71,9 +118,45 @@ export default class MessageSyncService {
       );
     `);
 
+    this._ensureMessageColumn('topic_id', 'INTEGER');
+
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS messages_channel_topic_idx
+      ON messages (channel_id, topic_id, message_id);
+    `);
+
+    this.db.exec(`
+      INSERT OR IGNORE INTO channels (channel_id, sync_enabled)
+      SELECT channel_id, 1
+      FROM jobs
+      WHERE channel_id IS NOT NULL;
+    `);
+
+    this.upsertChannelStmt = this.db.prepare(`
+      INSERT INTO channels (channel_id, peer_title, peer_type, username, updated_at)
+      VALUES (@channel_id, @peer_title, @peer_type, @username, CURRENT_TIMESTAMP)
+      ON CONFLICT(channel_id) DO UPDATE SET
+        peer_title = excluded.peer_title,
+        peer_type = excluded.peer_type,
+        username = excluded.username,
+        updated_at = CURRENT_TIMESTAMP
+      RETURNING channel_id, sync_enabled;
+    `);
+
     this.insertMessageStmt = this.db.prepare(`
-      INSERT OR IGNORE INTO messages (channel_id, message_id, date, from_id, text, raw_json)
-      VALUES (@channel_id, @message_id, @date, @from_id, @text, @raw_json)
+      INSERT OR IGNORE INTO messages (channel_id, message_id, topic_id, date, from_id, text, raw_json)
+      VALUES (@channel_id, @message_id, @topic_id, @date, @from_id, @text, @raw_json)
+    `);
+
+    this.upsertMessageStmt = this.db.prepare(`
+      INSERT INTO messages (channel_id, message_id, topic_id, date, from_id, text, raw_json)
+      VALUES (@channel_id, @message_id, @topic_id, @date, @from_id, @text, @raw_json)
+      ON CONFLICT(channel_id, message_id) DO UPDATE SET
+        topic_id = excluded.topic_id,
+        date = excluded.date,
+        from_id = excluded.from_id,
+        text = excluded.text,
+        raw_json = excluded.raw_json
     `);
 
     this.insertMessagesTx = this.db.transaction((records) => {
@@ -84,35 +167,145 @@ export default class MessageSyncService {
   }
 
   _ensureJobColumn(column, definition) {
-    const existing = this.db.prepare("PRAGMA table_info(jobs)").all();
+    const existing = this.db.prepare('PRAGMA table_info(jobs)').all();
     if (!existing.some((col) => col.name === column)) {
       this.db.exec(`ALTER TABLE jobs ADD COLUMN ${column} ${definition}`);
     }
   }
 
-  addJob(channelId, options = {}) {
-    const normalizedId = String(normalizeChannelId(channelId));
-    const target = options.depth && options.depth > 0 ? Number(options.depth) : DEFAULT_TARGET_MESSAGES;
+  _ensureMessageColumn(column, definition) {
+    const existing = this.db.prepare('PRAGMA table_info(messages)').all();
+    if (!existing.some((col) => col.name === column)) {
+      this.db.exec(`ALTER TABLE messages ADD COLUMN ${column} ${definition}`);
+    }
+  }
+
+  async refreshChannelsFromDialogs() {
+    const dialogs = await this.telegramClient.listDialogs(0);
+    this.upsertChannels(dialogs);
+    return dialogs.length;
+  }
+
+  upsertChannels(dialogs = []) {
+    const tx = this.db.transaction((items) => {
+      for (const dialog of items) {
+        this.upsertChannelStmt.get({
+          channel_id: String(dialog.id),
+          peer_title: dialog.title ?? null,
+          peer_type: dialog.type ?? null,
+          username: dialog.username ?? null,
+        });
+      }
+    });
+
+    tx(dialogs);
+  }
+
+  listActiveChannels() {
+    return this.db.prepare(`
+      SELECT channel_id, peer_title, peer_type, username, sync_enabled,
+             last_message_id, last_message_date, oldest_message_id, oldest_message_date,
+             created_at, updated_at
+      FROM channels
+      WHERE sync_enabled = 1
+      ORDER BY updated_at DESC
+    `).all();
+  }
+
+  setChannelSync(channelId, enabled) {
+    const normalizedId = normalizeChannelKey(channelId);
+    const value = enabled ? 1 : 0;
     const stmt = this.db.prepare(`
-      INSERT INTO jobs (channel_id, status, error, target_message_count, updated_at)
-      VALUES (?, '${JOB_STATUS.PENDING}', NULL, ?, CURRENT_TIMESTAMP)
+      INSERT INTO channels (channel_id, sync_enabled, updated_at)
+      VALUES (?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(channel_id) DO UPDATE SET
+        sync_enabled = excluded.sync_enabled,
+        updated_at = CURRENT_TIMESTAMP
+      RETURNING channel_id, sync_enabled;
+    `);
+
+    return stmt.get(normalizedId, value);
+  }
+
+  addJob(channelId, options = {}) {
+    const normalizedId = normalizeChannelKey(channelId);
+    const target = options.depth && options.depth > 0 ? Number(options.depth) : DEFAULT_TARGET_MESSAGES;
+    const minDate = options.minDate ? parseIsoDate(options.minDate) : null;
+    const minDateIso = minDate ? new Date(minDate * 1000).toISOString() : null;
+
+    this.db.prepare(`
+      INSERT INTO channels (channel_id, updated_at)
+      VALUES (?, CURRENT_TIMESTAMP)
+      ON CONFLICT(channel_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
+    `).run(normalizedId);
+
+    const stmt = this.db.prepare(`
+      INSERT INTO jobs (channel_id, status, error, target_message_count, message_count, cursor_message_id, backfill_min_date, updated_at)
+      VALUES (?, '${JOB_STATUS.PENDING}', NULL, ?, 0, NULL, ?, CURRENT_TIMESTAMP)
       ON CONFLICT(channel_id) DO UPDATE SET
         status='${JOB_STATUS.PENDING}',
         error=NULL,
-        target_message_count=?,
+        target_message_count=excluded.target_message_count,
+        backfill_min_date=excluded.backfill_min_date,
         updated_at=CURRENT_TIMESTAMP
       RETURNING *;
     `);
 
-    return stmt.get(normalizedId, target, target);
+    return stmt.get(normalizedId, target, minDateIso);
   }
 
   listJobs() {
     return this.db.prepare(`
-      SELECT id, channel_id, peer_title, peer_type, status, last_message_id, oldest_message_id, target_message_count, message_count, last_synced_at, created_at, updated_at, error
+      SELECT
+        jobs.id,
+        jobs.channel_id,
+        channels.peer_title,
+        channels.peer_type,
+        jobs.status,
+        jobs.target_message_count,
+        jobs.message_count,
+        jobs.cursor_message_id,
+        jobs.backfill_min_date,
+        jobs.last_synced_at,
+        jobs.created_at,
+        jobs.updated_at,
+        jobs.error
       FROM jobs
-      ORDER BY updated_at DESC
+      LEFT JOIN channels ON channels.channel_id = jobs.channel_id
+      ORDER BY jobs.updated_at DESC
     `).all();
+  }
+
+  startRealtimeSync() {
+    if (this.realtimeActive) {
+      return;
+    }
+
+    const newMessageHandler = (message) => {
+      this._handleIncomingMessage(message, { isEdit: false });
+    };
+    const editMessageHandler = (message) => {
+      this._handleIncomingMessage(message, { isEdit: true });
+    };
+    const deleteMessageHandler = (update) => {
+      this._handleDeleteMessage(update);
+    };
+
+    this.telegramClient.client.onNewMessage.add(newMessageHandler);
+    this.telegramClient.client.onEditMessage.add(editMessageHandler);
+    this.telegramClient.client.onDeleteMessage.add(deleteMessageHandler);
+
+    this.realtimeHandlers = {
+      newMessageHandler,
+      editMessageHandler,
+      deleteMessageHandler,
+    };
+
+    this.unsubscribeChannelTooLong = this.telegramClient.onChannelTooLong((payload) => {
+      this._handleChannelTooLong(payload);
+    });
+
+    this.realtimeActive = true;
   }
 
   async processQueue() {
@@ -151,6 +344,18 @@ export default class MessageSyncService {
       await delay(100);
     }
 
+    if (this.realtimeActive && this.realtimeHandlers) {
+      this.telegramClient.client.onNewMessage.remove(this.realtimeHandlers.newMessageHandler);
+      this.telegramClient.client.onEditMessage.remove(this.realtimeHandlers.editMessageHandler);
+      this.telegramClient.client.onDeleteMessage.remove(this.realtimeHandlers.deleteMessageHandler);
+      this.realtimeHandlers = null;
+      if (this.unsubscribeChannelTooLong) {
+        this.unsubscribeChannelTooLong();
+        this.unsubscribeChannelTooLong = null;
+      }
+      this.realtimeActive = false;
+    }
+
     if (this.db && this.db.open) {
       this.db.close();
     }
@@ -165,9 +370,9 @@ export default class MessageSyncService {
     `).get();
   }
 
-  searchMessages({ channelId, pattern, limit = 50, caseInsensitive = true }) {
-    const normalizedId = String(normalizeChannelId(channelId));
-    const flags = caseInsensitive ? "i" : "";
+  searchMessages({ channelId, topicId, pattern, limit = 50, caseInsensitive = true }) {
+    const normalizedId = normalizeChannelKey(channelId);
+    const flags = caseInsensitive ? 'i' : '';
     let regex;
     try {
       regex = new RegExp(pattern, flags);
@@ -175,22 +380,26 @@ export default class MessageSyncService {
       throw new Error(`Invalid pattern: ${error.message}`);
     }
 
+    const topicClause = typeof topicId === 'number' ? 'AND topic_id = ?' : '';
+    const params = typeof topicId === 'number' ? [normalizedId, topicId] : [normalizedId];
     const rows = this.db.prepare(`
-      SELECT message_id, date, from_id, text
+      SELECT message_id, date, from_id, text, topic_id
       FROM messages
       WHERE channel_id = ?
+      ${topicClause}
       ORDER BY message_id DESC
-    `).all(normalizedId);
+    `).all(...params);
 
     const matches = [];
     for (const row of rows) {
-      const text = row.text || "";
+      const text = row.text || '';
       if (regex.test(text)) {
         matches.push({
           messageId: row.message_id,
           date: row.date ? new Date(row.date * 1000).toISOString() : null,
           fromId: row.from_id,
           text,
+          topicId: row.topic_id ?? null,
         });
         if (matches.length >= limit) {
           break;
@@ -201,8 +410,32 @@ export default class MessageSyncService {
     return matches;
   }
 
+  getArchivedMessages({ channelId, topicId, limit = 50 }) {
+    const normalizedId = normalizeChannelKey(channelId);
+    const topicClause = typeof topicId === 'number' ? 'AND topic_id = ?' : '';
+    const params = typeof topicId === 'number'
+      ? [normalizedId, topicId, limit]
+      : [normalizedId, limit];
+    const rows = this.db.prepare(`
+      SELECT message_id, date, from_id, text, topic_id
+      FROM messages
+      WHERE channel_id = ?
+      ${topicClause}
+      ORDER BY message_id DESC
+      LIMIT ?
+    `).all(...params);
+
+    return rows.map((row) => ({
+      messageId: row.message_id,
+      date: row.date ? new Date(row.date * 1000).toISOString() : null,
+      fromId: row.from_id,
+      text: row.text,
+      topicId: row.topic_id ?? null,
+    }));
+  }
+
   getMessageStats(channelId) {
-    const normalizedId = String(normalizeChannelId(channelId));
+    const normalizedId = normalizeChannelKey(channelId);
     const summary = this.db.prepare(`
       SELECT
         COUNT(*) AS total,
@@ -227,36 +460,23 @@ export default class MessageSyncService {
     this._updateJobStatus(job.id, JOB_STATUS.IN_PROGRESS);
 
     try {
-      const newerDetails = await this._syncNewerMessages(job);
+      const channelId = normalizeChannelKey(job.channel_id);
+      await this._syncNewerMessages(channelId);
 
-      const backfillResult = await this._backfillHistory(
-        job,
-        newerDetails.totalMessages,
-        newerDetails.targetCount,
-        newerDetails.lastMessageId,
-      );
+      const currentCount = this._countMessages(channelId);
+      const targetCount = job.target_message_count || DEFAULT_TARGET_MESSAGES;
+      const backfillResult = await this._backfillHistory(job, currentCount, targetCount);
 
-      const finalCount = backfillResult.finalCount;
-      const finalOldest = backfillResult.oldestMessageId ?? newerDetails.oldestMessageId ?? job.oldest_message_id;
-      const finalLatest = newerDetails.lastMessageId ?? job.last_message_id ?? 0;
-
-      const shouldContinue =
-        newerDetails.hasMoreNewer ||
-        backfillResult.hasMoreOlder;
-
+      const shouldContinue = backfillResult.hasMoreOlder;
       const finalStatus = shouldContinue ? JOB_STATUS.PENDING : JOB_STATUS.IDLE;
 
       this._updateJobRecord(job.id, {
         status: finalStatus,
-        peerTitle: newerDetails.peerTitle,
-        peerType: newerDetails.peerType,
-        lastMessageId: finalLatest,
-        oldestMessageId: finalOldest,
-        messageCount: finalCount,
-        targetCount: newerDetails.targetCount,
+        messageCount: backfillResult.finalCount,
+        cursorMessageId: backfillResult.cursorMessageId,
       });
     } catch (error) {
-      const waitMatch = /wait of (\d+) seconds is required/i.exec(error.message || "");
+      const waitMatch = /wait of (\d+) seconds is required/i.exec(error.message || '');
       if (waitMatch) {
         const waitSeconds = Number(waitMatch[1]);
         this.db.prepare(`
@@ -279,36 +499,20 @@ export default class MessageSyncService {
     `).run(status, id);
   }
 
-  _updateJobRecord(id, {
-    status,
-    peerTitle,
-    peerType,
-    lastMessageId,
-    oldestMessageId,
-    messageCount,
-    targetCount,
-  }) {
+  _updateJobRecord(id, { status, messageCount, cursorMessageId }) {
     this.db.prepare(`
       UPDATE jobs
       SET status = ?,
-          peer_title = ?,
-          peer_type = ?,
-          last_message_id = ?,
-          oldest_message_id = ?,
           message_count = ?,
-          target_message_count = ?,
+          cursor_message_id = ?,
           last_synced_at = CURRENT_TIMESTAMP,
           error = NULL,
           updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `).run(
       status,
-      peerTitle,
-      peerType,
-      lastMessageId ?? 0,
-      oldestMessageId ?? null,
       messageCount ?? 0,
-      targetCount ?? DEFAULT_TARGET_MESSAGES,
+      cursorMessageId ?? null,
       id,
     );
   }
@@ -329,64 +533,309 @@ export default class MessageSyncService {
     `).get(String(channelId)).cnt;
   }
 
-  async _syncNewerMessages(job) {
-    const minId = job.last_message_id || 0;
-    const { peerTitle, peerType, messages } = await this.telegramClient.getMessagesByChannelId(job.channel_id, this.batchSize, { minId });
-
-    const newMessages = messages
-      .filter((msg) => msg.id > minId)
-      .sort((a, b) => a.id - b.id);
-
-    let lastMessageId = job.last_message_id || 0;
-    let oldestMessageId = job.oldest_message_id || null;
-
-    if (newMessages.length) {
-      const records = newMessages.map((msg) => ({
-        channel_id: String(job.channel_id),
-        message_id: msg.id,
-        date: msg.date ?? null,
-        from_id: msg.from_id ?? null,
-        text: msg.text ?? null,
-        raw_json: JSON.stringify(msg),
-      }));
-
-      this.insertMessagesTx(records);
-
-      lastMessageId = newMessages[newMessages.length - 1].id;
-      oldestMessageId = oldestMessageId ? Math.min(oldestMessageId, newMessages[0].id) : newMessages[0].id;
-    }
-
-    const totalMessages = this._countMessages(job.channel_id);
-
+  _buildMessageRecord(channelId, message) {
     return {
-      peerTitle,
-      peerType,
-      lastMessageId,
-      oldestMessageId,
-      totalMessages,
-      targetCount: job.target_message_count || DEFAULT_TARGET_MESSAGES,
-      hasMoreNewer: newMessages.length >= this.batchSize,
+      channel_id: channelId,
+      message_id: message.id,
+      topic_id: message.topic_id ?? null,
+      date: message.date ?? null,
+      from_id: message.from_id ?? null,
+      text: message.text ?? null,
+      raw_json: JSON.stringify(message),
     };
   }
 
-  async _backfillHistory(job, currentCount, targetCount, newestMessageId) {
+  _getChannel(channelId) {
+    return this.db.prepare(`
+      SELECT channel_id, peer_title, peer_type, username, sync_enabled,
+             last_message_id, last_message_date, oldest_message_id, oldest_message_date
+      FROM channels
+      WHERE channel_id = ?
+    `).get(channelId);
+  }
+
+  _updateChannelCursors(channelId, { lastMessageId, lastMessageDate, oldestMessageId, oldestMessageDate }) {
+    const existing = this._getChannel(channelId);
+    if (!existing) {
+      return;
+    }
+
+    let nextLastId = existing.last_message_id || 0;
+    let nextLastDate = existing.last_message_date || null;
+    if (Number.isFinite(lastMessageId) && lastMessageId > nextLastId) {
+      nextLastId = lastMessageId;
+      nextLastDate = lastMessageDate || nextLastDate;
+    }
+
+    let nextOldestId = existing.oldest_message_id || null;
+    let nextOldestDate = existing.oldest_message_date || null;
+    if (Number.isFinite(oldestMessageId) && (!nextOldestId || oldestMessageId < nextOldestId)) {
+      nextOldestId = oldestMessageId;
+      nextOldestDate = oldestMessageDate || nextOldestDate;
+    }
+
+    this.db.prepare(`
+      UPDATE channels
+      SET last_message_id = ?,
+          last_message_date = ?,
+          oldest_message_id = ?,
+          oldest_message_date = ?,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE channel_id = ?
+    `).run(
+      nextLastId,
+      nextLastDate,
+      nextOldestId,
+      nextOldestDate,
+      channelId,
+    );
+  }
+
+  _ensureChannelFromPeer(channelId, peer) {
+    const peerTitle = peer?.displayName ?? null;
+    const peerType = normalizePeerType(peer);
+    const username = peer?.username ?? null;
+    return this.upsertChannelStmt.get({
+      channel_id: channelId,
+      peer_title: peerTitle,
+      peer_type: peerType,
+      username,
+    });
+  }
+
+  _isChannelActive(channelId) {
+    const row = this.db.prepare(`
+      SELECT sync_enabled
+      FROM channels
+      WHERE channel_id = ?
+    `).get(channelId);
+
+    if (!row) {
+      return false;
+    }
+    return row.sync_enabled === 1;
+  }
+
+  _handleIncomingMessage(message, { isEdit }) {
+    if (!message?.chat?.id) {
+      return;
+    }
+
+    const channelId = String(message.chat.id);
+    const channelRow = this._ensureChannelFromPeer(channelId, message.chat);
+    const syncEnabled = channelRow ? channelRow.sync_enabled === 1 : this._isChannelActive(channelId);
+    if (!syncEnabled) {
+      return;
+    }
+
+    const serialized = this.telegramClient._serializeMessage(message, message.chat);
+    const record = this._buildMessageRecord(channelId, serialized);
+
+    if (isEdit) {
+      this.upsertMessageStmt.run(record);
+    } else {
+      this.insertMessageStmt.run(record);
+    }
+
+    const messageDate = toIsoString(serialized.date);
+    this._updateChannelCursors(channelId, {
+      lastMessageId: serialized.id,
+      lastMessageDate: messageDate,
+      oldestMessageId: serialized.id,
+      oldestMessageDate: messageDate,
+    });
+  }
+
+  _handleDeleteMessage(update) {
+    if (!update?.messageIds?.length) {
+      return;
+    }
+
+    const ids = update.messageIds;
+    const placeholders = ids.map(() => '?').join(', ');
+
+    if (update.channelId) {
+      const channelId = normalizeChannelKey(update.channelId);
+      this.db.prepare(`
+        DELETE FROM messages
+        WHERE channel_id = ? AND message_id IN (${placeholders})
+      `).run(channelId, ...ids);
+      return;
+    }
+
+    this.db.prepare(`
+      DELETE FROM messages
+      WHERE message_id IN (${placeholders})
+        AND channel_id IN (
+          SELECT channel_id FROM channels WHERE peer_type IN ('chat', 'user')
+        )
+    `).run(...ids);
+  }
+
+  _handleChannelTooLong({ channelId, diff }) {
+    if (!diff?.messages?.length) {
+      return;
+    }
+
+    const peers = PeersIndex.from(diff);
+    const records = [];
+    let batchChannelId = null;
+    let latestMessageId = null;
+    let latestMessageDate = null;
+    let oldestMessageId = null;
+    let oldestMessageDate = null;
+
+    for (const rawMessage of diff.messages) {
+      if (rawMessage._ === 'messageEmpty') {
+        continue;
+      }
+      const message = new Message(rawMessage, peers);
+      const channelKey = String(message.chat?.id ?? normalizeChannelKey(channelId));
+      batchChannelId = batchChannelId ?? channelKey;
+
+      const channelRow = this._ensureChannelFromPeer(channelKey, message.chat);
+      const syncEnabled = channelRow ? channelRow.sync_enabled === 1 : this._isChannelActive(channelKey);
+      if (!syncEnabled) {
+        continue;
+      }
+
+      const serialized = this.telegramClient._serializeMessage(message, message.chat);
+      records.push(this._buildMessageRecord(channelKey, serialized));
+
+      const messageDateIso = toIsoString(serialized.date);
+      if (Number.isFinite(serialized.id)) {
+        if (!latestMessageId || serialized.id > latestMessageId) {
+          latestMessageId = serialized.id;
+          latestMessageDate = messageDateIso;
+        }
+        if (!oldestMessageId || serialized.id < oldestMessageId) {
+          oldestMessageId = serialized.id;
+          oldestMessageDate = messageDateIso;
+        }
+      }
+    }
+
+    if (!records.length || !batchChannelId) {
+      return;
+    }
+
+    this.insertMessagesTx(records);
+
+    this._updateChannelCursors(batchChannelId, {
+      lastMessageId: latestMessageId,
+      lastMessageDate: latestMessageDate,
+      oldestMessageId: oldestMessageId,
+      oldestMessageDate: oldestMessageDate,
+    });
+
+    void this._syncNewerMessages(batchChannelId);
+  }
+
+  async _syncNewerMessages(channelId) {
+    const normalizedId = normalizeChannelKey(channelId);
+    const channel = this._getChannel(normalizedId);
+    if (!channel || channel.sync_enabled !== 1) {
+      return { hasMoreNewer: false };
+    }
+
+    let minId = channel.last_message_id || 0;
+    let lastMessageId = channel.last_message_id || 0;
+    let lastMessageDate = channel.last_message_date || null;
+    let oldestMessageId = channel.oldest_message_id || null;
+    let oldestMessageDate = channel.oldest_message_date || null;
+    let hasMoreNewer = false;
+    let peerTitle = channel.peer_title;
+    let peerType = channel.peer_type;
+
+    while (true) {
+      const { peerTitle: title, peerType: type, messages } = await this.telegramClient.getMessagesByChannelId(
+        normalizedId,
+        this.batchSize,
+        { minId },
+      );
+
+      peerTitle = title ?? peerTitle;
+      peerType = type ?? peerType;
+
+      const newMessages = messages
+        .filter((msg) => msg.id > minId)
+        .sort((a, b) => a.id - b.id);
+
+      if (!newMessages.length) {
+        hasMoreNewer = false;
+        break;
+      }
+
+      const records = newMessages.map((msg) => this._buildMessageRecord(normalizedId, msg));
+      this.insertMessagesTx(records);
+
+      const newest = newMessages[newMessages.length - 1];
+      const oldest = newMessages[0];
+
+      lastMessageId = newest.id;
+      lastMessageDate = toIsoString(newest.date) || lastMessageDate;
+
+      if (!oldestMessageId || oldest.id < oldestMessageId) {
+        oldestMessageId = oldest.id;
+        oldestMessageDate = toIsoString(oldest.date) || oldestMessageDate;
+      }
+
+      minId = newest.id;
+      hasMoreNewer = newMessages.length >= this.batchSize;
+
+      if (!hasMoreNewer) {
+        break;
+      }
+
+      await delay(this.interBatchDelayMs);
+    }
+
+    if (peerTitle || peerType) {
+      this.upsertChannelStmt.get({
+        channel_id: normalizedId,
+        peer_title: peerTitle ?? null,
+        peer_type: peerType ?? null,
+        username: channel.username ?? null,
+      });
+    }
+
+    this._updateChannelCursors(normalizedId, {
+      lastMessageId,
+      lastMessageDate,
+      oldestMessageId,
+      oldestMessageDate,
+    });
+
+    return {
+      hasMoreNewer,
+      lastMessageId,
+      oldestMessageId,
+    };
+  }
+
+  async _backfillHistory(job, currentCount, targetCount) {
     if (currentCount >= targetCount) {
       return {
         finalCount: currentCount,
-        oldestMessageId: job.oldest_message_id ?? null,
+        oldestMessageId: null,
+        oldestMessageDate: null,
         hasMoreOlder: false,
         insertedCount: 0,
+        cursorMessageId: job.cursor_message_id ?? null,
       };
     }
 
-    const peer = await this.telegramClient.client.resolvePeer(
-      normalizeChannelId(job.channel_id),
-    );
+    const channelId = normalizeChannelKey(job.channel_id);
+    const channel = this._getChannel(channelId);
+    const peer = await this.telegramClient.client.resolvePeer(normalizeChannelId(channelId));
+    const minDateSeconds = job.backfill_min_date ? parseIsoDate(job.backfill_min_date) : null;
 
     let total = currentCount;
-    let currentOldest = job.oldest_message_id ?? null;
+    let currentOldestId = channel?.oldest_message_id ?? null;
+    let currentOldestDate = channel?.oldest_message_date ?? null;
     let insertedCount = 0;
-    let nextOffsetId = job.oldest_message_id ?? newestMessageId ?? job.last_message_id ?? 0;
+    let nextOffsetId = job.cursor_message_id ?? currentOldestId ?? channel?.last_message_id ?? 0;
+    let stopDueToDate = false;
 
     while (total < targetCount) {
       if (!nextOffsetId || nextOffsetId <= 1) {
@@ -404,26 +853,21 @@ export default class MessageSyncService {
 
       const records = [];
       let lowestIdInChunk = null;
-      let chunkCount = 0;
+      let lowestDateInChunk = null;
 
       for await (const message of iterator) {
         const serialized = this.telegramClient._serializeMessage(message, peer);
-        records.push({
-          channel_id: String(job.channel_id),
-          message_id: serialized.id,
-          date: serialized.date ?? null,
-          from_id: serialized.from_id ?? null,
-          text: serialized.text ?? null,
-          raw_json: JSON.stringify(serialized),
-        });
+        if (minDateSeconds && serialized.date && serialized.date < minDateSeconds) {
+          stopDueToDate = true;
+          break;
+        }
 
-        lowestIdInChunk = lowestIdInChunk === null
-          ? serialized.id
-          : Math.min(lowestIdInChunk, serialized.id);
-        currentOldest = currentOldest
-          ? Math.min(currentOldest, serialized.id)
-          : serialized.id;
-        chunkCount += 1;
+        records.push(this._buildMessageRecord(channelId, serialized));
+
+        if (!lowestIdInChunk || serialized.id < lowestIdInChunk) {
+          lowestIdInChunk = serialized.id;
+          lowestDateInChunk = toIsoString(serialized.date);
+        }
       }
 
       if (!records.length) {
@@ -432,22 +876,36 @@ export default class MessageSyncService {
 
       this.insertMessagesTx(records);
 
-      total += chunkCount;
-      insertedCount += chunkCount;
+      total += records.length;
+      insertedCount += records.length;
       nextOffsetId = lowestIdInChunk ?? nextOffsetId;
 
-      if (total >= targetCount) {
+      if (lowestIdInChunk && (!currentOldestId || lowestIdInChunk < currentOldestId)) {
+        currentOldestId = lowestIdInChunk;
+        currentOldestDate = lowestDateInChunk || currentOldestDate;
+      }
+
+      if (stopDueToDate || total >= targetCount) {
         break;
       }
 
       await delay(this.interBatchDelayMs);
     }
 
+    if (currentOldestId) {
+      this._updateChannelCursors(channelId, {
+        oldestMessageId: currentOldestId,
+        oldestMessageDate: currentOldestDate,
+      });
+    }
+
     return {
-      finalCount: this._countMessages(job.channel_id),
-      oldestMessageId: currentOldest,
-      hasMoreOlder: insertedCount > 0 && total < targetCount,
+      finalCount: this._countMessages(channelId),
+      oldestMessageId: currentOldestId,
+      oldestMessageDate: currentOldestDate,
+      hasMoreOlder: insertedCount > 0 && total < targetCount && !stopDueToDate,
       insertedCount,
+      cursorMessageId: nextOffsetId ?? job.cursor_message_id ?? null,
     };
   }
 }
