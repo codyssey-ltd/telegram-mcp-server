@@ -106,6 +106,22 @@ export default class MessageSyncService {
     this._ensureJobColumn('backfill_min_date', 'TEXT');
 
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS users (
+        user_id TEXT PRIMARY KEY,
+        peer_type TEXT,
+        username TEXT,
+        display_name TEXT,
+        is_bot INTEGER,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS users_username_idx
+      ON users (username);
+    `);
+
+    this.db.exec(`
       CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         channel_id TEXT NOT NULL,
@@ -145,6 +161,17 @@ export default class MessageSyncService {
       RETURNING channel_id, sync_enabled;
     `);
 
+    this.upsertUserStmt = this.db.prepare(`
+      INSERT INTO users (user_id, peer_type, username, display_name, is_bot, updated_at)
+      VALUES (@user_id, @peer_type, @username, @display_name, @is_bot, CURRENT_TIMESTAMP)
+      ON CONFLICT(user_id) DO UPDATE SET
+        peer_type = COALESCE(excluded.peer_type, users.peer_type),
+        username = COALESCE(excluded.username, users.username),
+        display_name = COALESCE(excluded.display_name, users.display_name),
+        is_bot = COALESCE(excluded.is_bot, users.is_bot),
+        updated_at = CURRENT_TIMESTAMP
+    `);
+
     this.insertMessageStmt = this.db.prepare(`
       INSERT OR IGNORE INTO messages (channel_id, message_id, topic_id, date, from_id, text, raw_json)
       VALUES (@channel_id, @message_id, @topic_id, @date, @from_id, @text, @raw_json)
@@ -168,6 +195,12 @@ export default class MessageSyncService {
         inserted += result.changes;
       }
       return inserted;
+    });
+
+    this.upsertUsersTx = this.db.transaction((records) => {
+      for (const record of records) {
+        this.upsertUserStmt.run(record);
+      }
     });
   }
 
@@ -416,8 +449,16 @@ export default class MessageSyncService {
     const topicClause = typeof topicId === 'number' ? 'AND topic_id = ?' : '';
     const params = typeof topicId === 'number' ? [normalizedId, topicId] : [normalizedId];
     const rows = this.db.prepare(`
-      SELECT message_id, date, from_id, text, topic_id
+      SELECT
+        messages.message_id,
+        messages.date,
+        messages.from_id,
+        messages.text,
+        messages.topic_id,
+        users.username AS from_username,
+        users.display_name AS from_display_name
       FROM messages
+      LEFT JOIN users ON users.user_id = messages.from_id
       WHERE channel_id = ?
       ${topicClause}
       ORDER BY message_id DESC
@@ -431,6 +472,8 @@ export default class MessageSyncService {
           messageId: row.message_id,
           date: row.date ? new Date(row.date * 1000).toISOString() : null,
           fromId: row.from_id,
+          fromUsername: row.from_username ?? null,
+          fromDisplayName: row.from_display_name ?? null,
           text,
           topicId: row.topic_id ?? null,
         });
@@ -450,8 +493,16 @@ export default class MessageSyncService {
       ? [normalizedId, topicId, limit]
       : [normalizedId, limit];
     const rows = this.db.prepare(`
-      SELECT message_id, date, from_id, text, topic_id
+      SELECT
+        messages.message_id,
+        messages.date,
+        messages.from_id,
+        messages.text,
+        messages.topic_id,
+        users.username AS from_username,
+        users.display_name AS from_display_name
       FROM messages
+      LEFT JOIN users ON users.user_id = messages.from_id
       WHERE channel_id = ?
       ${topicClause}
       ORDER BY message_id DESC
@@ -462,6 +513,8 @@ export default class MessageSyncService {
       messageId: row.message_id,
       date: row.date ? new Date(row.date * 1000).toISOString() : null,
       fromId: row.from_id,
+      fromUsername: row.from_username ?? null,
+      fromDisplayName: row.from_display_name ?? null,
       text: row.text,
       topicId: row.topic_id ?? null,
     }));
@@ -603,6 +656,55 @@ export default class MessageSyncService {
     };
   }
 
+  _buildUserRecordFromPeer(peer) {
+    if (!peer?.id) {
+      return null;
+    }
+    const username = typeof peer.username === 'string' && peer.username ? peer.username : null;
+    let displayName = null;
+    if (typeof peer.displayName === 'string' && peer.displayName.trim()) {
+      displayName = peer.displayName.trim();
+    } else {
+      const nameParts = [peer.firstName, peer.lastName].filter(Boolean);
+      displayName = nameParts.length ? nameParts.join(' ') : null;
+    }
+    const peerType = normalizePeerType(peer);
+    const isBot = typeof peer.isBot === 'boolean' ? (peer.isBot ? 1 : 0) : null;
+
+    return {
+      user_id: peer.id.toString(),
+      peer_type: peerType,
+      username,
+      display_name: displayName,
+      is_bot: isBot,
+    };
+  }
+
+  _buildUserRecordFromSerialized(message) {
+    if (!message?.from_id) {
+      return null;
+    }
+    const userId = String(message.from_id);
+    if (!userId || userId === 'unknown') {
+      return null;
+    }
+    const username = message.from_username ?? null;
+    const displayName = message.from_display_name ?? null;
+    const peerType = message.from_peer_type ?? null;
+    const isBot = typeof message.from_is_bot === 'boolean' ? (message.from_is_bot ? 1 : 0) : null;
+    if (!username && !displayName && !peerType && isBot === null) {
+      return null;
+    }
+
+    return {
+      user_id: userId,
+      peer_type: peerType,
+      username,
+      display_name: displayName,
+      is_bot: isBot,
+    };
+  }
+
   _getChannel(channelId) {
     return this.db.prepare(`
       SELECT channel_id, peer_title, peer_type, username, sync_enabled,
@@ -686,6 +788,11 @@ export default class MessageSyncService {
       return;
     }
 
+    const senderRecord = this._buildUserRecordFromPeer(message.sender || message.from || message.author);
+    if (senderRecord) {
+      this.upsertUserStmt.run(senderRecord);
+    }
+
     const serialized = this.telegramClient._serializeMessage(message, message.chat);
     const record = this._buildMessageRecord(channelId, serialized);
 
@@ -737,6 +844,7 @@ export default class MessageSyncService {
 
     const peers = PeersIndex.from(diff);
     const records = [];
+    const userRecords = new Map();
     let batchChannelId = null;
     let latestMessageId = null;
     let latestMessageDate = null;
@@ -757,6 +865,11 @@ export default class MessageSyncService {
         continue;
       }
 
+      const senderRecord = this._buildUserRecordFromPeer(message.sender || message.from || message.author);
+      if (senderRecord) {
+        userRecords.set(senderRecord.user_id, senderRecord);
+      }
+
       const serialized = this.telegramClient._serializeMessage(message, message.chat);
       records.push(this._buildMessageRecord(channelKey, serialized));
 
@@ -775,6 +888,10 @@ export default class MessageSyncService {
 
     if (!records.length || !batchChannelId) {
       return;
+    }
+
+    if (userRecords.size) {
+      this.upsertUsersTx([...userRecords.values()]);
     }
 
     this.insertMessagesTx(records);
@@ -834,8 +951,19 @@ export default class MessageSyncService {
         break;
       }
 
+      const userRecords = new Map();
+      for (const message of newMessages) {
+        const userRecord = this._buildUserRecordFromSerialized(message);
+        if (userRecord) {
+          userRecords.set(userRecord.user_id, userRecord);
+        }
+      }
+
       const records = newMessages.map((msg) => this._buildMessageRecord(normalizedId, msg));
       this.insertMessagesTx(records);
+      if (userRecords.size) {
+        this.upsertUsersTx([...userRecords.values()]);
+      }
 
       const newest = newMessages[newMessages.length - 1];
       const oldest = newMessages[0];
@@ -939,6 +1067,7 @@ export default class MessageSyncService {
       });
 
       const records = [];
+      const userRecords = new Map();
       let lowestIdInChunk = null;
       let lowestDateInChunk = null;
       let lowestDateSecondsInChunk = null;
@@ -952,6 +1081,11 @@ export default class MessageSyncService {
         if (minDateSeconds && serialized.date && serialized.date < minDateSeconds) {
           stopDueToDate = true;
           break;
+        }
+
+        const senderRecord = this._buildUserRecordFromPeer(message.sender || message.from || message.author);
+        if (senderRecord) {
+          userRecords.set(senderRecord.user_id, senderRecord);
         }
 
         records.push(this._buildMessageRecord(channelId, serialized));
@@ -969,6 +1103,10 @@ export default class MessageSyncService {
 
       if (!records.length) {
         break;
+      }
+
+      if (userRecords.size) {
+        this.upsertUsersTx([...userRecords.values()]);
       }
 
       const inserted = this.insertMessagesTx(records);
