@@ -32,3 +32,8 @@
 - Keep commits atomic; include body details when altering session management or cache persistence.
 - PR descriptions should summarize intent, list manual verification (commands run, Telegram scenarios exercised), link related issues, and attach console excerpts when tool output changes.
 - Confirm no sensitive credentials or runtime artifacts from `data/` are committed before requesting review.
+
+## Workflow
+- On startup, read `backlog.md` and pull tasks from it.
+- Thoroughly verify implemented functionality (tests, smoke runs, manual checks).
+- Commit verified features before starting the next task.

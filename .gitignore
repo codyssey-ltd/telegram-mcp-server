@@ -129,6 +129,7 @@ dist
 # Custom ignores
 data/
 .private 
+backlog.md
 # Local caches
 .npm-cache/
 .private_/
