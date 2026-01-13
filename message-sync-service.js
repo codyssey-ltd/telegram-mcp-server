@@ -334,6 +334,7 @@ export default class MessageSyncService {
   }
 
   resumePendingJobs() {
+    this._resetErroredJobs();
     void this.processQueue();
   }
 
@@ -342,6 +343,14 @@ export default class MessageSyncService {
 
     while (this.processing) {
       await delay(100);
+    }
+
+    if (this.db && this.db.open) {
+      this.db.prepare(`
+        UPDATE jobs
+        SET status = ?, error = NULL, updated_at = CURRENT_TIMESTAMP
+        WHERE status = ?
+      `).run(JOB_STATUS.PENDING, JOB_STATUS.IN_PROGRESS);
     }
 
     if (this.realtimeActive && this.realtimeHandlers) {
@@ -368,6 +377,14 @@ export default class MessageSyncService {
       ORDER BY updated_at ASC
       LIMIT 1
     `).get();
+  }
+
+  _resetErroredJobs() {
+    this.db.prepare(`
+      UPDATE jobs
+      SET status = ?, error = NULL, updated_at = CURRENT_TIMESTAMP
+      WHERE status = ?
+    `).run(JOB_STATUS.PENDING, JOB_STATUS.ERROR);
   }
 
   searchMessages({ channelId, topicId, pattern, limit = 50, caseInsensitive = true }) {
@@ -457,15 +474,32 @@ export default class MessageSyncService {
   }
 
   async _processJob(job) {
+    if (this.stopRequested) {
+      this._updateJobStatus(job.id, JOB_STATUS.PENDING);
+      return;
+    }
+
     this._updateJobStatus(job.id, JOB_STATUS.IN_PROGRESS);
 
     try {
       const channelId = normalizeChannelKey(job.channel_id);
-      await this._syncNewerMessages(channelId);
+      const syncResult = await this._syncNewerMessages(channelId);
+      if (this.stopRequested || syncResult.stoppedEarly) {
+        this._updateJobStatus(job.id, JOB_STATUS.PENDING);
+        return;
+      }
 
       const currentCount = this._countMessages(channelId);
       const targetCount = job.target_message_count || DEFAULT_TARGET_MESSAGES;
       const backfillResult = await this._backfillHistory(job, currentCount, targetCount);
+      if (this.stopRequested || backfillResult.stoppedEarly) {
+        this._updateJobRecord(job.id, {
+          status: JOB_STATUS.PENDING,
+          messageCount: backfillResult.finalCount,
+          cursorMessageId: backfillResult.cursorMessageId,
+        });
+        return;
+      }
 
       const shouldContinue = backfillResult.hasMoreOlder;
       const finalStatus = shouldContinue ? JOB_STATUS.PENDING : JOB_STATUS.IDLE;
@@ -476,6 +510,10 @@ export default class MessageSyncService {
         cursorMessageId: backfillResult.cursorMessageId,
       });
     } catch (error) {
+      if (this.stopRequested) {
+        this._updateJobStatus(job.id, JOB_STATUS.PENDING);
+        return;
+      }
       const waitMatch = /wait of (\d+) seconds is required/i.exec(error.message || '');
       if (waitMatch) {
         const waitSeconds = Number(waitMatch[1]);
@@ -735,7 +773,7 @@ export default class MessageSyncService {
     const normalizedId = normalizeChannelKey(channelId);
     const channel = this._getChannel(normalizedId);
     if (!channel || channel.sync_enabled !== 1) {
-      return { hasMoreNewer: false };
+      return { hasMoreNewer: false, stoppedEarly: false };
     }
 
     let minId = channel.last_message_id || 0;
@@ -744,15 +782,25 @@ export default class MessageSyncService {
     let oldestMessageId = channel.oldest_message_id || null;
     let oldestMessageDate = channel.oldest_message_date || null;
     let hasMoreNewer = false;
+    let stoppedEarly = false;
     let peerTitle = channel.peer_title;
     let peerType = channel.peer_type;
 
     while (true) {
+      if (this.stopRequested) {
+        stoppedEarly = true;
+        break;
+      }
       const { peerTitle: title, peerType: type, messages } = await this.telegramClient.getMessagesByChannelId(
         normalizedId,
         this.batchSize,
         { minId },
       );
+
+      if (this.stopRequested) {
+        stoppedEarly = true;
+        break;
+      }
 
       peerTitle = title ?? peerTitle;
       peerType = type ?? peerType;
@@ -783,7 +831,10 @@ export default class MessageSyncService {
       minId = newest.id;
       hasMoreNewer = newMessages.length >= this.batchSize;
 
-      if (!hasMoreNewer) {
+      if (!hasMoreNewer || this.stopRequested) {
+        if (this.stopRequested) {
+          stoppedEarly = true;
+        }
         break;
       }
 
@@ -810,6 +861,7 @@ export default class MessageSyncService {
       hasMoreNewer,
       lastMessageId,
       oldestMessageId,
+      stoppedEarly,
     };
   }
 
@@ -822,6 +874,7 @@ export default class MessageSyncService {
         hasMoreOlder: false,
         insertedCount: 0,
         cursorMessageId: job.cursor_message_id ?? null,
+        stoppedEarly: false,
       };
     }
 
@@ -836,8 +889,13 @@ export default class MessageSyncService {
     let insertedCount = 0;
     let nextOffsetId = job.cursor_message_id ?? currentOldestId ?? channel?.last_message_id ?? 0;
     let stopDueToDate = false;
+    let stoppedEarly = false;
 
     while (total < targetCount) {
+      if (this.stopRequested) {
+        stoppedEarly = true;
+        break;
+      }
       if (!nextOffsetId || nextOffsetId <= 1) {
         break;
       }
@@ -856,6 +914,10 @@ export default class MessageSyncService {
       let lowestDateInChunk = null;
 
       for await (const message of iterator) {
+        if (this.stopRequested) {
+          stoppedEarly = true;
+          break;
+        }
         const serialized = this.telegramClient._serializeMessage(message, peer);
         if (minDateSeconds && serialized.date && serialized.date < minDateSeconds) {
           stopDueToDate = true;
@@ -868,6 +930,10 @@ export default class MessageSyncService {
           lowestIdInChunk = serialized.id;
           lowestDateInChunk = toIsoString(serialized.date);
         }
+      }
+
+      if (this.stopRequested) {
+        break;
       }
 
       if (!records.length) {
@@ -885,7 +951,10 @@ export default class MessageSyncService {
         currentOldestDate = lowestDateInChunk || currentOldestDate;
       }
 
-      if (stopDueToDate || total >= targetCount) {
+      if (stopDueToDate || total >= targetCount || this.stopRequested) {
+        if (this.stopRequested) {
+          stoppedEarly = true;
+        }
         break;
       }
 
@@ -903,9 +972,10 @@ export default class MessageSyncService {
       finalCount: this._countMessages(channelId),
       oldestMessageId: currentOldestId,
       oldestMessageDate: currentOldestDate,
-      hasMoreOlder: insertedCount > 0 && total < targetCount && !stopDueToDate,
+      hasMoreOlder: insertedCount > 0 && total < targetCount && !stopDueToDate && !stoppedEarly,
       insertedCount,
       cursorMessageId: nextOffsetId ?? job.cursor_message_id ?? null,
+      stoppedEarly,
     };
   }
 }
