@@ -1211,6 +1211,72 @@ export default class MessageSyncService {
     }));
   }
 
+  async scanTaggedMessages(options = {}) {
+    const normalizedTag = normalizeTag(options.tag);
+    if (!normalizedTag) {
+      return {
+        tag: null,
+        source: null,
+        autoTag: false,
+        taggedChannelCount: 0,
+        messageCount: 0,
+        taggedChannels: [],
+        messages: [],
+      };
+    }
+
+    const source = options.source ? String(options.source) : 'auto';
+    const autoTag = options.autoTag !== false;
+    const autoTagLimit = options.autoTagLimit && options.autoTagLimit > 0
+      ? Number(options.autoTagLimit)
+      : 50;
+    const refreshMetadata = options.refreshMetadata !== false;
+    const channelLimit = options.channelLimit && options.channelLimit > 0
+      ? Number(options.channelLimit)
+      : 100;
+    const messageLimit = options.messageLimit && options.messageLimit > 0
+      ? Number(options.messageLimit)
+      : 100;
+    const channelIds = Array.isArray(options.channelIds) ? options.channelIds : null;
+
+    if (autoTag) {
+      await this.autoTagChannels({
+        channelIds,
+        limit: autoTagLimit,
+        source,
+        refreshMetadata,
+      });
+    }
+
+    const taggedChannels = this.listTaggedChannels(normalizedTag, {
+      source,
+      limit: channelLimit,
+    });
+
+    const messages = this.searchTaggedMessages({
+      tag: normalizedTag,
+      query: options.query,
+      fromDate: options.fromDate,
+      toDate: options.toDate,
+      limit: messageLimit,
+      source,
+    });
+
+    return {
+      tag: normalizedTag,
+      source,
+      query: typeof options.query === 'string' ? options.query : null,
+      fromDate: options.fromDate ?? null,
+      toDate: options.toDate ?? null,
+      autoTag,
+      autoTagLimit,
+      taggedChannelCount: taggedChannels.length,
+      messageCount: messages.length,
+      taggedChannels,
+      messages,
+    };
+  }
+
   async _processJob(job) {
     if (this.stopRequested) {
       this._updateJobStatus(job.id, JOB_STATUS.PENDING);

@@ -27,6 +27,7 @@ An MCP server allowing AI assistants (like Claude or Cursor) to interact with yo
 | `listMessageSyncJobs` | Displays tracked sync jobs, cursors, and statuses. |
 | `searchSyncedMessages` | Searches archived messages with a regex filter. |
 | `searchTaggedMessages` | Searches archived messages across channels that share a tag. |
+| `scanTaggedMessages` | Auto-tags channels (optional) and searches tagged messages (defaults to last 30 days). |
 | `getSyncedMessageStats` | Returns summary statistics for archived messages. |
 | `getArchivedTopicMessages` | Fetches archived messages for a forum topic. |
 
@@ -131,6 +132,12 @@ There are two separate configurations that need to be set up:
   setChannelTags { "channelId": -1001234567890, "tags": ["ai"] }
   autoTagChannels { "channelIds": [-1001234567890] }
   searchTaggedMessages { "tag": "ai", "query": "course OR курс", "fromDate": "2025-12-01T00:00:00Z" }
+  ```
+
+- Use `scanTaggedMessages` to auto-tag channels (optional) and search tagged messages in one call (defaults to last 30 days):
+
+  ```
+  scanTaggedMessages { "tag": "ai", "query": "course OR курс" }
   ```
 
 ## Troubleshooting

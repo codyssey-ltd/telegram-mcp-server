@@ -269,6 +269,65 @@ const searchTaggedMessagesSchema = {
     .describe("Optional tag source to filter by"),
 };
 
+const scanTaggedMessagesSchema = {
+  tag: z
+    .string({ invalid_type_error: "tag must be a string" })
+    .min(1)
+    .describe("Tag label to scan"),
+  query: z
+    .string({ invalid_type_error: "query must be a string" })
+    .optional()
+    .describe("FTS query string to match message text"),
+  fromDate: z
+    .string({ invalid_type_error: "fromDate must be a string" })
+    .optional()
+    .describe("ISO-8601 start date (inclusive, default: now-30d)"),
+  toDate: z
+    .string({ invalid_type_error: "toDate must be a string" })
+    .optional()
+    .describe("ISO-8601 end date (inclusive)"),
+  autoTag: z
+    .boolean({ invalid_type_error: "autoTag must be a boolean" })
+    .optional()
+    .describe("Auto-tag channels before searching (default true)"),
+  autoTagLimit: z
+    .number({ invalid_type_error: "autoTagLimit must be a number" })
+    .int()
+    .positive()
+    .optional()
+    .describe("Maximum number of channels to auto-tag (default 50)"),
+  channelIds: z
+    .array(
+      z.union([
+        z.number({ invalid_type_error: "channelId must be a number" }),
+        z.string({ invalid_type_error: "channelId must be a string" }).min(1),
+      ]),
+    )
+    .optional()
+    .describe("Optional list of channel IDs/usernames to auto-tag"),
+  source: z
+    .string()
+    .optional()
+    .describe("Tag source label (default auto)"),
+  refreshMetadata: z
+    .boolean({ invalid_type_error: "refreshMetadata must be a boolean" })
+    .optional()
+    .describe("Refresh cached metadata before tagging (default true)"),
+  channelLimit: z
+    .number({ invalid_type_error: "channelLimit must be a number" })
+    .int()
+    .positive()
+    .optional()
+    .describe("Maximum number of tagged channels to return (default 100)"),
+  messageLimit: z
+    .number({ invalid_type_error: "messageLimit must be a number" })
+    .int()
+    .positive()
+    .max(500)
+    .optional()
+    .describe("Maximum number of messages to return (default 100)"),
+};
+
 const listChannelTopicsSchema = {
   channelId: z
     .union([
@@ -755,6 +814,54 @@ function createServerInstance() {
         toDate,
         limit,
         source,
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(results, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
+    "scanTaggedMessages",
+    "Auto-tags channels (optional) and searches archived messages across tagged channels.",
+    scanTaggedMessagesSchema,
+    async ({
+      tag,
+      query,
+      fromDate,
+      toDate,
+      autoTag,
+      autoTagLimit,
+      channelIds,
+      source,
+      refreshMetadata,
+      channelLimit,
+      messageLimit,
+    }) => {
+      const shouldAutoTag = autoTag !== false;
+      if (shouldAutoTag) {
+        await telegramClient.ensureLogin();
+      }
+      const resolvedFromDate = fromDate ?? new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+      const results = await messageSyncService.scanTaggedMessages({
+        tag,
+        query,
+        fromDate: resolvedFromDate,
+        toDate,
+        autoTag: shouldAutoTag,
+        autoTagLimit,
+        channelIds,
+        source,
+        refreshMetadata,
+        channelLimit,
+        messageLimit,
       });
 
       return {
