@@ -51,6 +51,23 @@ async function initializeTelegram() {
  * Represents an active MCP session – a transport plus its server instance.
  */
 const sessions = new Map();
+let shuttingDown = false;
+
+function closeSessionRecord(record, context) {
+  if (!record || record.closing) {
+    return null;
+  }
+  record.closing = true;
+  if (record.sessionId) {
+    sessions.delete(record.sessionId);
+  }
+  if (record.transport?.close) {
+    return record.transport.close().catch((error) => {
+      console.error(`[server] error closing ${context}: ${error.message}`);
+    });
+  }
+  return null;
+}
 
 const listChannelsSchema = {
   limit: z.number().int().positive().optional().describe("Maximum number of channels to return (default: 50)"),
@@ -820,6 +837,20 @@ function createServerInstance() {
 }
 
 async function ensureSession(req, res, body) {
+  if (shuttingDown) {
+    res.writeHead(503, { "Content-Type": "application/json" }).end(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        error: {
+          code: -32000,
+          message: "Server is shutting down",
+        },
+        id: null,
+      }),
+    );
+    return null;
+  }
+
   const sessionId = req.headers["mcp-session-id"];
 
   if (sessionId && typeof sessionId === "string") {
@@ -866,11 +897,9 @@ async function ensureSession(req, res, body) {
     onsessionclosed: (sessionId) => {
       const existing = sessions.get(sessionId);
       if (existing) {
-        void existing.server?.close().catch((error) => {
-          console.error(`[server] error closing session ${sessionId}: ${error.message}`);
-        });
+        existing.closing = true;
+        sessions.delete(sessionId);
       }
-      sessions.delete(sessionId);
     },
   });
 
@@ -884,9 +913,6 @@ async function ensureSession(req, res, body) {
     if (record.sessionId) {
       sessions.delete(record.sessionId);
     }
-    void record.server?.close().catch((error) => {
-      console.error(`[server] error closing transport session: ${error.message}`);
-    });
   };
 
   const serverInstance = createServerInstance();
@@ -941,6 +967,20 @@ async function handlePost(req, res) {
 }
 
 async function handleSessionRequest(req, res) {
+  if (shuttingDown) {
+    res.writeHead(503, { "Content-Type": "application/json" }).end(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        error: {
+          code: -32000,
+          message: "Server is shutting down",
+        },
+        id: null,
+      }),
+    );
+    return;
+  }
+
   const sessionIdHeader = req.headers["mcp-session-id"];
   if (!sessionIdHeader || typeof sessionIdHeader !== "string") {
     res.writeHead(400, { "Content-Type": "application/json" }).end(
@@ -1046,7 +1086,21 @@ server.on("error", (error) => {
 });
 
 async function shutdown() {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
   console.log("[shutdown] received termination signal, closing resources...");
+  const closeTasks = [];
+  for (const record of sessions.values()) {
+    const task = closeSessionRecord(record, "shutdown");
+    if (task) {
+      closeTasks.push(task);
+    }
+  }
+  if (closeTasks.length) {
+    await Promise.allSettled(closeTasks);
+  }
   server.closeAllConnections?.();
   server.close(() => {
     console.log("[shutdown] HTTP server closed");
