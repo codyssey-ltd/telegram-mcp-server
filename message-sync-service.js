@@ -7,6 +7,7 @@ import { normalizeChannelId } from './telegram-client.js';
 
 const DEFAULT_DB_PATH = './data/messages.db';
 const DEFAULT_TARGET_MESSAGES = 1000;
+const SEARCH_INDEX_VERSION = 1;
 const JOB_STATUS = {
   PENDING: 'pending',
   IN_PROGRESS: 'in_progress',
@@ -39,6 +40,12 @@ function parseIsoDate(value) {
 function toIsoString(dateSeconds) {
   if (!dateSeconds) return null;
   return new Date(dateSeconds * 1000).toISOString();
+}
+
+function normalizeTag(tag) {
+  if (!tag) return null;
+  const normalized = String(tag).trim().toLowerCase();
+  return normalized.replace(/\s+/g, ' ');
 }
 
 export default class MessageSyncService {
@@ -80,6 +87,23 @@ export default class MessageSyncService {
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
+    `);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS channel_tags (
+        channel_id TEXT NOT NULL,
+        tag TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'manual',
+        confidence REAL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (channel_id, tag, source)
+      );
+    `);
+
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS channel_tags_tag_idx
+      ON channel_tags (tag);
     `);
 
     this.db.exec(`
@@ -139,6 +163,69 @@ export default class MessageSyncService {
     this._ensureMessageColumn('topic_id', 'INTEGER');
 
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS search_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT
+      );
+    `);
+
+    const searchSchema = this.db.prepare(`
+      SELECT sql FROM sqlite_master
+      WHERE type = 'table' AND name = 'message_search'
+    `).get();
+    const needsSearchRecreate = !searchSchema?.sql
+      || !searchSchema.sql.includes("tokenize='unicode61'");
+    const storedVersion = this.db.prepare(`
+      SELECT value FROM search_meta WHERE key = 'search_index_version'
+    `).get()?.value;
+    const needsVersionRebuild = Number(storedVersion ?? 0) !== SEARCH_INDEX_VERSION;
+    const shouldRebuildSearch = needsSearchRecreate || needsVersionRebuild;
+
+    if (needsSearchRecreate) {
+      this.db.exec(`
+        DROP TRIGGER IF EXISTS messages_ai;
+        DROP TRIGGER IF EXISTS messages_ad;
+        DROP TRIGGER IF EXISTS messages_au;
+        DROP TABLE IF EXISTS message_search;
+      `);
+    }
+
+    this.db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS message_search USING fts5(
+        text,
+        content='messages',
+        content_rowid='id',
+        tokenize='unicode61'
+      );
+    `);
+
+    this.db.exec(`
+      CREATE TRIGGER IF NOT EXISTS messages_ai
+      AFTER INSERT ON messages BEGIN
+        INSERT INTO message_search(rowid, text)
+        VALUES (new.id, COALESCE(new.text, ''));
+      END;
+    `);
+
+    this.db.exec(`
+      CREATE TRIGGER IF NOT EXISTS messages_ad
+      AFTER DELETE ON messages BEGIN
+        INSERT INTO message_search(message_search, rowid, text)
+        VALUES ('delete', old.id, COALESCE(old.text, ''));
+      END;
+    `);
+
+    this.db.exec(`
+      CREATE TRIGGER IF NOT EXISTS messages_au
+      AFTER UPDATE ON messages BEGIN
+        INSERT INTO message_search(message_search, rowid, text)
+        VALUES ('delete', old.id, COALESCE(old.text, ''));
+        INSERT INTO message_search(rowid, text)
+        VALUES (new.id, COALESCE(new.text, ''));
+      END;
+    `);
+
+    this.db.exec(`
       CREATE INDEX IF NOT EXISTS messages_channel_topic_idx
       ON messages (channel_id, topic_id, message_id);
     `);
@@ -159,6 +246,19 @@ export default class MessageSyncService {
         username = excluded.username,
         updated_at = CURRENT_TIMESTAMP
       RETURNING channel_id, sync_enabled;
+    `);
+
+    this.insertChannelTagStmt = this.db.prepare(`
+      INSERT INTO channel_tags (channel_id, tag, source, confidence, updated_at)
+      VALUES (@channel_id, @tag, @source, @confidence, CURRENT_TIMESTAMP)
+      ON CONFLICT(channel_id, tag, source) DO UPDATE SET
+        confidence = excluded.confidence,
+        updated_at = CURRENT_TIMESTAMP
+    `);
+
+    this.deleteChannelTagsStmt = this.db.prepare(`
+      DELETE FROM channel_tags
+      WHERE channel_id = ? AND source = ?
     `);
 
     this.upsertUserStmt = this.db.prepare(`
@@ -197,11 +297,32 @@ export default class MessageSyncService {
       return inserted;
     });
 
+    this.setChannelTagsTx = this.db.transaction((channelId, source, tags) => {
+      this.deleteChannelTagsStmt.run(channelId, source);
+      for (const tag of tags) {
+        this.insertChannelTagStmt.run({
+          channel_id: channelId,
+          tag,
+          source,
+          confidence: null,
+        });
+      }
+    });
+
     this.upsertUsersTx = this.db.transaction((records) => {
       for (const record of records) {
         this.upsertUserStmt.run(record);
       }
     });
+
+    if (shouldRebuildSearch) {
+      this.db.prepare("INSERT INTO message_search(message_search) VALUES ('rebuild')").run();
+      this.db.prepare(`
+        INSERT INTO search_meta (key, value)
+        VALUES ('search_index_version', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run(String(SEARCH_INDEX_VERSION));
+    }
   }
 
   _ensureJobColumn(column, definition) {
@@ -263,6 +384,77 @@ export default class MessageSyncService {
     `);
 
     return stmt.get(normalizedId, value);
+  }
+
+  setChannelTags(channelId, tags, options = {}) {
+    const normalizedId = normalizeChannelKey(channelId);
+    const source = options.source ? String(options.source) : 'manual';
+    const uniqueTags = new Set();
+    for (const tag of tags || []) {
+      const normalizedTag = normalizeTag(tag);
+      if (normalizedTag) {
+        uniqueTags.add(normalizedTag);
+      }
+    }
+    const finalTags = [...uniqueTags];
+
+    this.db.prepare(`
+      INSERT INTO channels (channel_id, updated_at)
+      VALUES (?, CURRENT_TIMESTAMP)
+      ON CONFLICT(channel_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
+    `).run(normalizedId);
+
+    this.setChannelTagsTx(normalizedId, source, finalTags);
+    return finalTags;
+  }
+
+  listChannelTags(channelId, options = {}) {
+    const normalizedId = normalizeChannelKey(channelId);
+    const source = options.source ? String(options.source) : null;
+    const rows = this.db.prepare(`
+      SELECT tag, source, confidence, created_at, updated_at
+      FROM channel_tags
+      WHERE channel_id = ?
+      ${source ? 'AND source = ?' : ''}
+      ORDER BY tag ASC
+    `).all(...(source ? [normalizedId, source] : [normalizedId]));
+
+    return rows.map((row) => ({
+      tag: row.tag,
+      source: row.source,
+      confidence: row.confidence,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }));
+  }
+
+  listTaggedChannels(tag, options = {}) {
+    const normalizedTag = normalizeTag(tag);
+    if (!normalizedTag) {
+      return [];
+    }
+    const source = options.source ? String(options.source) : null;
+    const limit = options.limit && options.limit > 0 ? Number(options.limit) : 100;
+    const rows = this.db.prepare(`
+      SELECT channels.channel_id, channels.peer_title, channels.peer_type, channels.username,
+             channel_tags.tag, channel_tags.source, channel_tags.confidence
+      FROM channel_tags
+      JOIN channels ON channels.channel_id = channel_tags.channel_id
+      WHERE channel_tags.tag = ?
+      ${source ? 'AND channel_tags.source = ?' : ''}
+      ORDER BY channels.peer_title ASC
+      LIMIT ?
+    `).all(...(source ? [normalizedTag, source, limit] : [normalizedTag, limit]));
+
+    return rows.map((row) => ({
+      channelId: row.channel_id,
+      peerTitle: row.peer_title,
+      peerType: row.peer_type,
+      username: row.username,
+      tag: row.tag,
+      source: row.source,
+      confidence: row.confidence,
+    }));
   }
 
   addJob(channelId, options = {}) {
@@ -540,6 +732,110 @@ export default class MessageSyncService {
       oldestDate: summary.oldestDate ? new Date(summary.oldestDate * 1000).toISOString() : null,
       newestDate: summary.newestDate ? new Date(summary.newestDate * 1000).toISOString() : null,
     };
+  }
+
+  searchTaggedMessages({ tag, query, fromDate, toDate, limit = 100, source = null }) {
+    const normalizedTag = normalizeTag(tag);
+    if (!normalizedTag) {
+      return [];
+    }
+    const queryText = typeof query === 'string' ? query.trim() : '';
+    const params = [normalizedTag];
+    const sourceClause = source ? 'AND channel_tags.source = ?' : '';
+    if (source) {
+      params.push(String(source));
+    }
+
+    let dateClause = '';
+    if (fromDate) {
+      params.push(parseIsoDate(fromDate));
+      dateClause += ' AND messages.date >= ?';
+    }
+    if (toDate) {
+      params.push(parseIsoDate(toDate));
+      dateClause += ' AND messages.date <= ?';
+    }
+
+    const finalLimit = limit && limit > 0 ? Number(limit) : 100;
+
+    if (queryText) {
+      params.push(queryText);
+      params.push(finalLimit);
+      const rows = this.db.prepare(`
+        SELECT
+          messages.channel_id,
+          channels.peer_title,
+          channels.username,
+          messages.message_id,
+          messages.date,
+          messages.from_id,
+          messages.text,
+          messages.topic_id,
+          users.username AS from_username,
+          users.display_name AS from_display_name
+        FROM message_search
+        JOIN messages ON messages.id = message_search.rowid
+        JOIN channel_tags ON channel_tags.channel_id = messages.channel_id
+        LEFT JOIN channels ON channels.channel_id = messages.channel_id
+        LEFT JOIN users ON users.user_id = messages.from_id
+        WHERE channel_tags.tag = ?
+        ${sourceClause}
+        ${dateClause}
+        AND message_search MATCH ?
+        ORDER BY messages.date DESC
+        LIMIT ?
+      `).all(...params);
+
+      return rows.map((row) => ({
+        channelId: row.channel_id,
+        peerTitle: row.peer_title,
+        username: row.username,
+        messageId: row.message_id,
+        date: row.date ? new Date(row.date * 1000).toISOString() : null,
+        fromId: row.from_id,
+        fromUsername: row.from_username ?? null,
+        fromDisplayName: row.from_display_name ?? null,
+        text: row.text,
+        topicId: row.topic_id ?? null,
+      }));
+    }
+
+    params.push(finalLimit);
+    const rows = this.db.prepare(`
+      SELECT
+        messages.channel_id,
+        channels.peer_title,
+        channels.username,
+        messages.message_id,
+        messages.date,
+        messages.from_id,
+        messages.text,
+        messages.topic_id,
+        users.username AS from_username,
+        users.display_name AS from_display_name
+      FROM messages
+      JOIN channel_tags ON channel_tags.channel_id = messages.channel_id
+      LEFT JOIN channels ON channels.channel_id = messages.channel_id
+      LEFT JOIN users ON users.user_id = messages.from_id
+      WHERE channel_tags.tag = ?
+      ${sourceClause}
+      ${dateClause}
+      ORDER BY messages.date DESC
+      LIMIT ?
+    `).all(...params);
+
+    return rows.map((row) => ({
+      channelId: row.channel_id,
+      peerTitle: row.peer_title,
+      username: row.username,
+      messageId: row.message_id,
+      date: row.date ? new Date(row.date * 1000).toISOString() : null,
+      fromId: row.from_id,
+      fromUsername: row.from_username ?? null,
+      fromDisplayName: row.from_display_name ?? null,
+      text: row.text,
+      topicId: row.topic_id ?? null,
+    }));
   }
 
   async _processJob(job) {

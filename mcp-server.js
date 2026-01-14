@@ -64,6 +64,48 @@ const searchChannelsSchema = {
   limit: z.number().int().positive().optional().describe("Maximum number of results to return (default: 100)"),
 };
 
+const setChannelTagsSchema = {
+  channelId: z
+    .union([
+      z.number({ invalid_type_error: "channelId must be a number" }),
+      z.string({ invalid_type_error: "channelId must be a string" }).min(1),
+    ])
+    .describe("Numeric channel ID or username"),
+  tags: z
+    .array(z.string().min(1))
+    .min(1)
+    .describe("List of tags to attach to the channel"),
+  source: z
+    .string()
+    .optional()
+    .describe("Tag source label (default: manual)"),
+};
+
+const listChannelTagsSchema = {
+  channelId: z
+    .union([
+      z.number({ invalid_type_error: "channelId must be a number" }),
+      z.string({ invalid_type_error: "channelId must be a string" }).min(1),
+    ])
+    .describe("Numeric channel ID or username"),
+  source: z
+    .string()
+    .optional()
+    .describe("Optional tag source to filter by"),
+};
+
+const listTaggedChannelsSchema = {
+  tag: z
+    .string()
+    .min(1)
+    .describe("Tag label to look up"),
+  source: z
+    .string()
+    .optional()
+    .describe("Optional tag source to filter by"),
+  limit: z.number().int().positive().optional().describe("Maximum number of channels to return (default: 100)"),
+};
+
 const getChannelMessagesSchema = {
   channelId: z
     .union([
@@ -127,6 +169,36 @@ const searchSyncedMessagesSchema = {
     .positive()
     .optional()
     .describe("Optional forum topic ID to constrain the search"),
+};
+
+const searchTaggedMessagesSchema = {
+  tag: z
+    .string({ invalid_type_error: "tag must be a string" })
+    .min(1)
+    .describe("Tag label to filter channels"),
+  query: z
+    .string({ invalid_type_error: "query must be a string" })
+    .optional()
+    .describe("FTS query string to match message text"),
+  fromDate: z
+    .string({ invalid_type_error: "fromDate must be a string" })
+    .optional()
+    .describe("ISO-8601 start date (inclusive)"),
+  toDate: z
+    .string({ invalid_type_error: "toDate must be a string" })
+    .optional()
+    .describe("ISO-8601 end date (inclusive)"),
+  limit: z
+    .number({ invalid_type_error: "limit must be a number" })
+    .int()
+    .positive()
+    .max(500)
+    .optional()
+    .describe("Maximum number of results to return (default 100)"),
+  source: z
+    .string()
+    .optional()
+    .describe("Optional tag source to filter by"),
 };
 
 const listChannelTopicsSchema = {
@@ -250,6 +322,60 @@ function createServerInstance() {
   );
 
   server.tool(
+    "setChannelTags",
+    "Assign tags to a channel for later cross-channel search.",
+    setChannelTagsSchema,
+    async ({ channelId, tags, source }) => {
+      const finalTags = messageSyncService.setChannelTags(channelId, tags, { source });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ channelId, tags: finalTags }, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
+    "listChannelTags",
+    "List tags attached to a channel.",
+    listChannelTagsSchema,
+    async ({ channelId, source }) => {
+      const tags = messageSyncService.listChannelTags(channelId, { source });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(tags, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
+    "listTaggedChannels",
+    "List channels that carry a specific tag.",
+    listTaggedChannelsSchema,
+    async ({ tag, source, limit }) => {
+      const channels = messageSyncService.listTaggedChannels(tag, { source, limit });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(channels, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
     "getChannelMessages",
     "Retrieves recent messages for a channel by numeric ID or username.",
     getChannelMessagesSchema,
@@ -266,6 +392,9 @@ function createServerInstance() {
         date: msg.date ? new Date(msg.date * 1000).toISOString() : "unknown",
         text: msg.text ?? msg.message ?? "",
         from_id: msg.from_id ?? "unknown",
+        from_username: msg.from_username ?? null,
+        from_display_name: msg.from_display_name ?? null,
+        from_is_bot: typeof msg.from_is_bot === "boolean" ? msg.from_is_bot : null,
         topic_id: msg.topic_id ?? null,
       }));
 
@@ -402,6 +531,9 @@ function createServerInstance() {
         date: msg.date ? new Date(msg.date * 1000).toISOString() : "unknown",
         text: msg.text ?? msg.message ?? "",
         from_id: msg.from_id ?? "unknown",
+        from_username: msg.from_username ?? null,
+        from_display_name: msg.from_display_name ?? null,
+        from_is_bot: typeof msg.from_is_bot === "boolean" ? msg.from_is_bot : null,
         topic_id: msg.topic_id ?? null,
       }));
 
@@ -464,6 +596,31 @@ function createServerInstance() {
         pattern,
         limit,
         caseInsensitive,
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(results, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
+    "searchTaggedMessages",
+    "Search archived messages across channels that share a tag.",
+    searchTaggedMessagesSchema,
+    async ({ tag, query, fromDate, toDate, limit, source }) => {
+      const results = messageSyncService.searchTaggedMessages({
+        tag,
+        query,
+        fromDate,
+        toDate,
+        limit,
+        source,
       });
 
       return {

@@ -13,6 +13,9 @@ An MCP server allowing AI assistants (like Claude or Cursor) to interact with yo
 | `listChannels` | Lists available dialogs/channels (limit configurable). |
 | `searchChannels` | Searches dialogs by title or username. |
 | `listActiveChannels` | Lists dialogs tracked in the local archive registry. |
+| `setChannelTags` | Assigns tags to a channel for cross-channel search. |
+| `listChannelTags` | Lists tags attached to a channel. |
+| `listTaggedChannels` | Lists channels that carry a specific tag. |
 | `getChannelMessages` | Fetches recent messages (ID or username, optional regex filter). |
 | `listChannelTopics` | Lists forum topics for a supergroup. |
 | `searchChannelTopics` | Searches forum topics by title. |
@@ -20,6 +23,7 @@ An MCP server allowing AI assistants (like Claude or Cursor) to interact with yo
 | `scheduleMessageSync` | Schedules a background job to archive a dialog into SQLite. |
 | `listMessageSyncJobs` | Displays tracked sync jobs, cursors, and statuses. |
 | `searchSyncedMessages` | Searches archived messages with a regex filter. |
+| `searchTaggedMessages` | Searches archived messages across channels that share a tag. |
 | `getSyncedMessageStats` | Returns summary statistics for archived messages. |
 | `getArchivedTopicMessages` | Fetches archived messages for a forum topic. |
 
@@ -113,6 +117,16 @@ There are two separate configurations that need to be set up:
 
 - List or search topics with `listChannelTopics` and `searchChannelTopics`.
 - Fetch recent messages in a topic using `getTopicMessages` (online) or `getArchivedTopicMessages` (local archive).
+
+## Channel Tags & Cross-Channel Search
+
+- Tag channels with `setChannelTags`, then retrieve them via `listTaggedChannels`.
+- Search across tagged channels with `searchTaggedMessages` using an FTS query plus optional date range:
+
+  ```
+  setChannelTags { "channelId": -1001234567890, "tags": ["ai"] }
+  searchTaggedMessages { "tag": "ai", "query": "course OR курс", "fromDate": "2025-12-01T00:00:00Z" }
+  ```
 
 ## Troubleshooting
 
