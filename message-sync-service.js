@@ -890,6 +890,43 @@ export default class MessageSyncService {
     `).all();
   }
 
+  getQueueStats() {
+    const rows = this.db.prepare(`
+      SELECT status, COUNT(*) AS count
+      FROM jobs
+      GROUP BY status
+    `).all();
+    const stats = {
+      pending: 0,
+      in_progress: 0,
+      idle: 0,
+      error: 0,
+    };
+    for (const row of rows) {
+      if (row.status in stats) {
+        stats[row.status] = row.count;
+      }
+    }
+    return {
+      processing: this.processing,
+      ...stats,
+    };
+  }
+
+  getSearchStatus() {
+    const row = this.db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name = 'message_search'
+    `).get();
+    const version = this.db.prepare(`
+      SELECT value FROM search_meta WHERE key = 'search_index_version'
+    `).get()?.value ?? null;
+    return {
+      enabled: Boolean(row?.name),
+      version: version ? Number(version) : null,
+    };
+  }
+
   startRealtimeSync() {
     if (this.realtimeActive) {
       return;
