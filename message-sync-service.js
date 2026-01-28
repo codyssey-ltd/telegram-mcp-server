@@ -1831,7 +1831,29 @@ export default class MessageSyncService {
     return stmt.get(normalizedId, target, minDateIso);
   }
 
-  listJobs() {
+  listJobs(options = {}) {
+    const status = options.status ? String(options.status) : null;
+    const channelId = options.channelId ? normalizeChannelKey(options.channelId) : null;
+    const limit = options.limit && options.limit > 0 ? Number(options.limit) : null;
+    const clauses = [];
+    const params = [];
+
+    if (status) {
+      clauses.push('jobs.status = ?');
+      params.push(status);
+    }
+
+    if (channelId) {
+      clauses.push('jobs.channel_id = ?');
+      params.push(channelId);
+    }
+
+    const whereClause = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const limitClause = limit ? 'LIMIT ?' : '';
+    if (limit) {
+      params.push(limit);
+    }
+
     return this.db.prepare(`
       SELECT
         jobs.id,
@@ -1850,8 +1872,102 @@ export default class MessageSyncService {
         jobs.error
       FROM jobs
       LEFT JOIN channels ON channels.channel_id = jobs.channel_id
+      ${whereClause}
       ORDER BY jobs.updated_at DESC
-    `).all();
+      ${limitClause}
+    `).all(...params);
+  }
+
+  retryJobs(options = {}) {
+    const allErrors = Boolean(options.allErrors);
+    const channelId = options.channelId ? normalizeChannelKey(options.channelId) : null;
+    const jobId = options.jobId !== undefined && options.jobId !== null ? Number(options.jobId) : null;
+
+    if (!allErrors && jobId === null && !channelId) {
+      throw new Error('Provide jobId, channelId, or allErrors to retry.');
+    }
+    if (allErrors && (jobId !== null || channelId)) {
+      throw new Error('Use allErrors without jobId/channelId.');
+    }
+    if (jobId !== null && !Number.isFinite(jobId)) {
+      throw new Error('jobId must be a number.');
+    }
+
+    let ids = [];
+    if (allErrors) {
+      ids = this.db.prepare(`
+        SELECT id
+        FROM jobs
+        WHERE status = ?
+      `).all(JOB_STATUS.ERROR).map((row) => row.id);
+    } else if (jobId !== null) {
+      const row = this.db.prepare('SELECT id FROM jobs WHERE id = ?').get(jobId);
+      if (row) {
+        ids = [row.id];
+      }
+    } else if (channelId) {
+      ids = this.db.prepare(`
+        SELECT id
+        FROM jobs
+        WHERE channel_id = ?
+      `).all(channelId).map((row) => row.id);
+    }
+
+    if (!ids.length) {
+      return { updated: 0, jobIds: [] };
+    }
+
+    const tx = this.db.transaction((entries) => {
+      for (const id of entries) {
+        this.db.prepare(`
+          UPDATE jobs
+          SET status = ?, error = NULL, updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?
+        `).run(JOB_STATUS.PENDING, id);
+      }
+    });
+    tx(ids);
+
+    return { updated: ids.length, jobIds: ids };
+  }
+
+  cancelJobs(options = {}) {
+    const channelId = options.channelId ? normalizeChannelKey(options.channelId) : null;
+    const jobId = options.jobId !== undefined && options.jobId !== null ? Number(options.jobId) : null;
+
+    if (jobId === null && !channelId) {
+      throw new Error('Provide jobId or channelId to cancel.');
+    }
+    if (jobId !== null && !Number.isFinite(jobId)) {
+      throw new Error('jobId must be a number.');
+    }
+
+    let ids = [];
+    if (jobId !== null) {
+      const row = this.db.prepare('SELECT id FROM jobs WHERE id = ?').get(jobId);
+      if (row) {
+        ids = [row.id];
+      }
+    } else if (channelId) {
+      ids = this.db.prepare(`
+        SELECT id
+        FROM jobs
+        WHERE channel_id = ?
+      `).all(channelId).map((row) => row.id);
+    }
+
+    if (!ids.length) {
+      return { canceled: 0, jobIds: [] };
+    }
+
+    const tx = this.db.transaction((entries) => {
+      for (const id of entries) {
+        this.db.prepare('DELETE FROM jobs WHERE id = ?').run(id);
+      }
+    });
+    tx(ids);
+
+    return { canceled: ids.length, jobIds: ids };
   }
 
   getQueueStats() {
