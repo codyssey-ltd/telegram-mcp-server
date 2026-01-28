@@ -22,6 +22,7 @@
     "mcp-server.js",
     "store-lock.js",
     "telegram-client.js",
+    "scripts/install-cli.sh",
     "LIBRARY.md",
     "README.md",
     "LICENSE"
