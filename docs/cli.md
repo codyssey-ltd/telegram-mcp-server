@@ -1,0 +1,81 @@
+# Target CLI Commands (vNext)
+
+CLI goal: wacli-style UX with human-readable output by default and --json for scripting.
+
+## Global flags
+- --store DIR (default: ~/.frogiverse)
+- --json
+- --timeout DURATION (non-sync commands)
+- --version
+
+## auth
+- auth
+  - Interactive login (Telegram MTProto), then bootstrap sync.
+  - Flags: --follow, --idle-exit 30s, --download-media
+- auth status
+- auth logout
+
+## sync
+- sync
+  - Flags: --once | --follow, --idle-exit 30s, --download-media, --refresh-contacts, --refresh-groups
+- sync status
+- sync jobs list [--status] [--limit] [--channel]
+- sync jobs add --chat <id|username> [--min-date ISO] [--depth N]
+- sync jobs retry [--job-id] [--channel] [--all-errors]
+- sync jobs cancel --job-id|--channel
+
+## doctor
+- doctor [--connect]
+  - Checks auth, lock, FTS, last sync, queue state.
+
+## channels
+- channels list [--limit] [--query]
+- channels show --chat <id|username>
+- channels sync --chat <id|username> --enable|--disable
+
+## topics (forum supergroups)
+- topics list --chat <id|username> [--limit]
+- topics search --chat <id|username> --query <text> [--limit]
+
+## messages
+- messages list [--chat] [--topic] [--source archive|live|both] [--after ISO] [--before ISO] [--limit]
+- messages search <query> [--chat] [--topic] [--source] [--after] [--before] [--tag] [--regex] [--limit]
+- messages show --chat <id> --id <msgId> [--source]
+- messages context --chat <id> --id <msgId> [--before N] [--after N] [--source]
+
+## send
+- send text --to <id|username> --message "..." [--topic]
+- send file --to <id|username> --file PATH [--caption] [--filename]
+
+## media
+- media download --chat <id|username> --id <msgId> [--output PATH]
+
+## tags
+- tags set --chat <id|username> --tags ai,news [--source]
+- tags list --chat <id|username> [--source]
+- tags search --tag ai [--source] [--limit]
+- tags auto [--chat ...] [--limit] [--refresh-metadata]
+
+## metadata
+- metadata get --chat <id|username>
+- metadata refresh [--chat ...] [--limit] [--force] [--only-missing]
+
+## contacts (users)
+- contacts search <query> [--limit]
+- contacts show --user <id>
+- contacts alias set --user <id> --alias "Name"
+- contacts alias rm --user <id>
+- contacts tags add --user <id> --tag <tag> [--tag ...]
+- contacts tags rm --user <id> --tag <tag> [--tag ...]
+- contacts notes set --user <id> --notes "..."
+
+## groups (optional, permission-based)
+- groups list [--query]
+- groups info --chat <id>
+- groups rename --chat <id> --name "New Name"
+- groups members add --chat <id> --user <id> [--user ...]
+- groups members remove --chat <id> --user <id> [--user ...]
+- groups invite link get --chat <id>
+- groups invite link revoke --chat <id>
+- groups join --code <invite-code>
+- groups leave --chat <id>
