@@ -15,9 +15,6 @@ This library (`telegram-client.js`) enables programmatic interaction with Telegr
 ```javascript
 // Example using the client library (see client.js for a more complete example)
 import TelegramClient from "./telegram-client.js";
-import dotenv from "dotenv";
-
-dotenv.config();
 
 async function main() {
   // Create a new client instance

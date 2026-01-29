@@ -55,12 +55,12 @@ There are two separate configurations that need to be set up:
 
 1. **MCP Server Configuration:**
 
-   Configure the Telegram MCP server using environment variables (in a `.env` file or directly in your environment):
+   Configure the Telegram MCP server using environment variables set in your shell or system service:
 
-   ```dotenv
-   TELEGRAM_API_ID=YOUR_API_ID
-   TELEGRAM_API_HASH=YOUR_API_HASH
-   TELEGRAM_PHONE_NUMBER=YOUR_PHONE_NUMBER_WITH_COUNTRY_CODE # e.g., +15551234567
+   ```bash
+   export TELEGRAM_API_ID=YOUR_API_ID
+   export TELEGRAM_API_HASH=YOUR_API_HASH
+   export TELEGRAM_PHONE_NUMBER=YOUR_PHONE_NUMBER_WITH_COUNTRY_CODE # e.g., +15551234567
    ```
 
    Replace the placeholder values with your actual credentials.

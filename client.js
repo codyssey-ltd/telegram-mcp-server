@@ -1,7 +1,4 @@
-import dotenv from 'dotenv';
 import TelegramClient from './telegram-client.js';
-
-dotenv.config();
 
 async function main() {
   const client = new TelegramClient(

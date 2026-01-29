@@ -3,13 +3,10 @@ import { randomUUID } from "crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import dotenv from "dotenv";
 import { z } from "zod";
 
 import { createServices } from "./core/services.js";
 import { resolveStoreDir } from "./core/store.js";
-
-dotenv.config();
 
 const HOST = process.env.MCP_HOST ?? process.env.FASTMCP_HOST ?? "127.0.0.1";
 const PORT = Number(process.env.MCP_PORT ?? process.env.FASTMCP_PORT ?? "8080");

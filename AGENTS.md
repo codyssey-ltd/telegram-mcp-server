@@ -6,7 +6,7 @@
 - `client.js`: Example CLI harness for manual testing without the MCP layer.
 - `message-sync-service.js`: Background worker that archives messages into a local SQLite database.
 - Store location: OS app-data dir (tgcli store; override with `TGCLI_STORE`); keep runtime artifacts out of version control.
-- Documentation lives in `README.md` and `LIBRARY.md`; configuration relies on a local `.env` file.
+- Documentation lives in `README.md` and `LIBRARY.md`; configuration relies on environment variables and the tgcli store.
 
 ## Build, Test, and Development Commands
 - `npm install`: Restore dependencies whenever `package-lock.json` changes.

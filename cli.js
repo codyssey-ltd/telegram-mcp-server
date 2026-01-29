@@ -3,13 +3,10 @@ import fs from 'fs';
 import { spawn } from 'child_process';
 import { setTimeout as delay } from 'timers/promises';
 import { fileURLToPath } from 'url';
-import dotenv from 'dotenv';
 
 import { acquireStoreLock, readStoreLock } from './store-lock.js';
 import { createServices } from './core/services.js';
 import { resolveStoreDir } from './core/store.js';
-
-dotenv.config();
 
 function printUsage() {
   const text = `tgcli CLI\n\n` +
