@@ -1,12 +1,13 @@
-# Target CLI Commands (vNext)
+# tgcli CLI Commands
 
-CLI goal: wacli-style UX with human-readable output by default and --json for scripting.
+CLI goal: human-readable output by default with --json for scripting.
 
 ## Global flags
-- --store DIR (default: ~/.frogiverse)
 - --json
-- --timeout DURATION (non-sync commands)
+- --timeout DURATION
 - --version
+
+Store location: OS app data dir (override with TGCLI_STORE).
 
 ## auth
 - auth
@@ -23,6 +24,10 @@ CLI goal: wacli-style UX with human-readable output by default and --json for sc
 - sync jobs add --chat <id|username> [--min-date ISO] [--depth N]
 - sync jobs retry [--job-id] [--channel] [--all-errors]
 - sync jobs cancel --job-id|--channel
+
+## server
+- server
+  - Start the MCP HTTP server.
 
 ## doctor
 - doctor [--connect]

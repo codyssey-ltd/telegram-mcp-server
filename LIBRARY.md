@@ -25,7 +25,7 @@ async function main() {
     process.env.TELEGRAM_API_ID,
     process.env.TELEGRAM_API_HASH,
     process.env.TELEGRAM_PHONE_NUMBER
-    // Optional: specify session path, default is './data/session.json'
+    // Optional: specify session path (default uses the tgcli store)
   );
 
   await client.initializeDialogCache();
@@ -63,7 +63,7 @@ const client = new TelegramClient(apiId, apiHash, phoneNumber, sessionPath);
 - `apiId`: Your Telegram API ID
 - `apiHash`: Your Telegram API Hash
 - `phoneNumber`: Your phone number in international format
-- `sessionPath`: (Optional) Path to save the session file (default: './data/session.json')
+- `sessionPath`: (Optional) Path to save the session file (default uses the tgcli store)
 
 #### Methods
 

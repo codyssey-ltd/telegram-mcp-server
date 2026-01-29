@@ -1,10 +1,10 @@
-# Telegram MCP Server
+# tgcli
 
 **Revival update (September 2025).** The server now runs on the official `@modelcontextprotocol/sdk` transport, backed by the MtCute Telegram client and a sequential background archive worker writing into SQLite.
-**Breaking changes.** MCP clients must target `http://localhost:8080/mcp`; message history now lives in `data/messages.db`, and new sync tools drive archival jobs. The legacy implementation remains published as branch `legacy-0.x` and tag `v0-legacy` if you need the old `/sse` flow.
-**Key changes:** `/mcp` endpoint, MtCute session handling, message-sync job queue, SQLite archive, CLI workflows in `cli.js` (auth/sync/diagnostics/media).
+**Breaking changes.** MCP clients must target `http://localhost:8080/mcp`; message history now lives in the tgcli store, and new sync tools drive archival jobs. The legacy implementation remains published as branch `legacy-0.x` and tag `v0-legacy` if you need the old `/sse` flow.
+**Key changes:** `/mcp` endpoint, MtCute session handling, message-sync job queue, SQLite archive, CLI workflows in `tgcli` (auth/sync/diagnostics/media).
 
-An MCP server allowing AI assistants (like Claude or Cursor) to interact with your Telegram account using the user client API (not the bot API). The stack rides on the official `@modelcontextprotocol/sdk` Streamable HTTP transport and exposes Telegram-oriented tools for listing dialogs, fetching messages, and managing background sync jobs.
+tgcli is an MCP server allowing AI assistants (like Claude or Cursor) to interact with your Telegram account using the user client API (not the bot API). The stack rides on the official `@modelcontextprotocol/sdk` Streamable HTTP transport and exposes Telegram-oriented tools for listing dialogs, fetching messages, and managing background sync jobs.
 
 ## MCP Tools (current)
 
@@ -26,17 +26,27 @@ An MCP server allowing AI assistants (like Claude or Cursor) to interact with yo
 3.  **Telegram API Credentials:**
     - Obtain an `api_id` and `api_hash` by creating a new application at [https://core.telegram.org/api/obtaining_api_id](https://core.telegram.org/api/obtaining_api_id).
 
-## Installation
+## Install
 
-1.  Clone this repository:
-    ```bash
-    git clone https://github.com/your-username/telegram-mcp-server.git # Replace with your repo URL
-    cd telegram-mcp-server
-    ```
-2.  Install dependencies:
-    ```bash
-    npm install
-    ```
+### npm
+
+```bash
+npm install -g @kfastov/tgcli
+```
+
+### Homebrew
+
+```bash
+brew install kfastov/tap/tgcli
+```
+
+### From source
+
+```bash
+git clone https://github.com/your-username/telegram-mcp-server.git # Replace with your repo URL
+cd telegram-mcp-server
+npm install
+```
 
 ## Configuration
 
@@ -77,43 +87,52 @@ There are two separate configurations that need to be set up:
 
    **Important:** Restart your MCP client to apply the changes.
 
+## Store Location
+
+tgcli keeps the session, SQLite archive, and downloads in the OS app-data directory:
+
+- macOS: `~/Library/Application Support/tgcli`
+- Linux: `$XDG_DATA_HOME/tgcli` (fallback `~/.local/share/tgcli`)
+- Windows: `%APPDATA%\\tgcli`
+
+Override the location with `TGCLI_STORE`.
+
 ## Running the Server
 
-1.  Run the server:
+```bash
+tgcli server
+```
 
-    ```bash
-    npm start
-    ```
+On the first run the server will authenticate via MTProto. Enter the login code from Telegram and (if enabled) your 2FA password. After a successful login a persistent session file is saved under `session.json` inside the tgcli store, so restarts won't prompt again unless the session is revoked.
 
-    On the first run the server will authenticate via MTProto. Enter the login code from Telegram and (if enabled) your 2FA password. After a successful login a persistent session file is saved under `./data/session.json`, so restarts won't prompt again unless the session is revoked.
+You can still run the dev entrypoint directly:
 
-2.  Point your MCP client at the same URL. Cursor/Claude will send the standard `initialize → notifications/initialized → tools/list` sequence, which the SDK transport handles automatically. Once connected you should see the Telegram toolset in the client UI.
+```bash
+npm start
+```
 
 ## CLI
 
-The CLI lives in `cli.js` and is useful for local workflows (auth, sync, doctor, media). By default it uses `~/.frogiverse` for storage; set `--store ./data` or `FROGIVERSE_STORE` to share the MCP server store.
-
 ```bash
-node cli.js auth
-node cli.js sync --follow
-node cli.js doctor
-node cli.js channels list --limit 10
-node cli.js messages search "course" --chat -1001234567890 --source archive
-node cli.js send text --to @channel --message "hello"
-node cli.js media download --chat -1001234567890 --id 42
-node cli.js topics list --chat -1001234567890 --limit 20
-node cli.js tags set --chat -1001234567890 --tags ai,news
-node cli.js contacts search "alex"
-node cli.js groups list --query "Nha Trang"
+tgcli auth
+tgcli sync --follow
+tgcli doctor
+tgcli channels list --limit 10
+tgcli messages search "course" --chat -1001234567890 --source archive
+tgcli send text --to @channel --message "hello"
+tgcli media download --chat -1001234567890 --id 42
+tgcli topics list --chat -1001234567890 --limit 20
+tgcli tags set --chat -1001234567890 --tags ai,news
+tgcli contacts search "alex"
+tgcli groups list --query "Nha Trang"
 ```
 
-Use `--json` for machine-readable output.
-Optional install: run `./scripts/install-cli.sh` to install the `frogiverse` command via `npm link`.
+Use `--json` for machine-readable output. Set `TGCLI_STORE` if you want to point the CLI to a different store location.
 
 ## Background Message Sync
 
-- Jobs and archived messages are stored in `data/messages.db` (SQLite).
-- Use `scheduleMessageSync` to enable backfill for a channel, then run the worker with the MCP server or `node cli.js sync --follow`.
+- Jobs and archived messages are stored in `messages.db` inside the tgcli store (SQLite).
+- Use `scheduleMessageSync` to enable backfill for a channel, then run the worker with `tgcli server` or `tgcli sync --follow`.
 - The server processes sync jobs sequentially and waits between requests to avoid hitting Telegram rate limits.
 - Use the MCP tools to manage jobs:
 
@@ -148,9 +167,8 @@ Optional install: run `./scripts/install-cli.sh` to install the `frogiverse` com
 
 ## Troubleshooting
 
-- **Login Prompts:** If the server keeps prompting for login codes/passwords when started by the MCP client, ensure the `data/session.json` file exists and is valid. You might need to run `npm start` manually once to refresh the session. Also, check that the file permissions allow the user running the MCP client to read/write the `data` directory.
-- **Store Mismatch:** The CLI defaults to `~/.frogiverse`, while the MCP server uses `./data`. Use `--store ./data` or set `FROGIVERSE_STORE` to share sessions/archives.
-- **Store Lock:** If the CLI reports a lock, run `node cli.js doctor` and ensure no other process is using the same store.
+- **Login Prompts:** If the server keeps prompting for login codes/passwords when started by the MCP client, ensure the `session.json` file exists inside the tgcli store. You might need to run `tgcli auth` or `tgcli server` manually once to refresh the session.
+- **Store Lock:** If the CLI reports a lock, run `tgcli doctor` and ensure no other process is using the same store.
 - **Cache Issues:** If channels seem outdated or missing, restart the server or call `refreshChannelMetadata`.
 - **Cannot Find Module:** Ensure you run `npm install` in the project directory. If the MCP client starts the server, make sure the working directory is set correctly or use absolute paths.
 - **Other Issues:** If you encounter any other problems, feel free to open an issue in [this server repo](https://github.com/kfastov/telegram-mcp-server).
