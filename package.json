@@ -1,6 +1,6 @@
 {
   "name": "@kfastov/tgcli",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "type": "module",
   "description": "Telegram CLI + MCP server powered by MTProto and the official MCP SDK",
   "main": "mcp-server.js",
@@ -14,7 +14,7 @@
     "test": "echo \"No tests specified yet\""
   },
   "bin": {
-    "tgcli": "./cli.js"
+    "tgcli": "cli.js"
   },
   "files": [
     "cli.js",
@@ -52,8 +52,8 @@
   "homepage": "https://github.com/kfastov/telegram-mcp-server#readme",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.2",
-    "@mtcute/core": "^0.27.6",
-    "@mtcute/node": "^0.27.6",
+    "@mtcute/core": "^0.27.8",
+    "@mtcute/node": "^0.27.8",
     "better-sqlite3": "^12.6.0"
   }
 }
