@@ -322,13 +322,12 @@ function buildProgram() {
     .option('--user <id>', 'User id', collectList)
     .action(withGlobalOptions((globalFlags, options) => runGroupMembersRemove(globalFlags, options)));
   const groupInvite = groups.command('invite').description('Manage invite links');
-  const groupInviteLink = groupInvite.command('link').description('Invite links');
-  groupInviteLink
+  groupInvite
     .command('get')
     .description('Get invite link')
     .option('--chat <id|username>', 'Group identifier')
     .action(withGlobalOptions((globalFlags, options) => runGroupInviteLinkGet(globalFlags, options)));
-  groupInviteLink
+  groupInvite
     .command('revoke')
     .description('Revoke invite link')
     .option('--chat <id|username>', 'Group identifier')

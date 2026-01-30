@@ -80,7 +80,7 @@ Store location: OS app data dir (override with TGCLI_STORE).
 - groups rename --chat <id> --name "New Name"
 - groups members add --chat <id> --user <id> [--user ...]
 - groups members remove --chat <id> --user <id> [--user ...]
-- groups invite link get --chat <id>
-- groups invite link revoke --chat <id>
+- groups invite get --chat <id>
+- groups invite revoke --chat <id>
 - groups join --code <invite-code>
 - groups leave --chat <id>
