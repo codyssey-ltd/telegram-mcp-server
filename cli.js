@@ -4,63 +4,383 @@ import { spawn } from 'child_process';
 import { setTimeout as delay } from 'timers/promises';
 import { fileURLToPath } from 'url';
 import readline from 'readline';
+import { Command } from 'commander';
 
 import { acquireStoreLock, readStoreLock } from './store-lock.js';
 import { loadConfig, normalizeConfig, saveConfig, validateConfig } from './core/config.js';
 import { createServices } from './core/services.js';
 import { resolveStoreDir } from './core/store.js';
 
-function printUsage() {
-  const text = `tgcli CLI\n\n` +
-    `Usage:\n` +
-    `  tgcli [--json] [--timeout 30s] [--version] <command> [options]\n\n` +
-    `Commands:\n` +
-    `  auth [--follow]\n` +
-    `  auth status\n` +
-    `  auth logout\n` +
-    `  sync [--once|--follow] [--idle-exit 30s]\n` +
-    `  sync status\n` +
-    `  sync jobs list [--status pending|in_progress|idle|error] [--limit N] [--channel <id|username>]\n` +
-    `  sync jobs add --chat <id|username> [--depth N] [--min-date ISO]\n` +
-    `  sync jobs retry [--job-id N] [--channel <id|username>] [--all-errors]\n` +
-    `  sync jobs cancel --job-id N|--channel <id|username>\n` +
-    `  server\n` +
-    `  doctor [--connect]\n` +
-    `  channels list [--query TEXT] [--limit N]\n` +
-    `  channels show --chat <id|username>\n` +
-    `  channels sync --chat <id|username> --enable|--disable\n` +
-    `  messages list [--chat <id|username>] [--topic <id>] [--source archive|live|both] [--after ISO] [--before ISO] [--limit N]\n` +
-    `  messages search <query> [--chat <id|username>] [--topic <id>] [--source archive|live|both] [--after ISO] [--before ISO] [--tag TAG] [--regex REGEX] [--limit N]\n` +
-    `  messages show --chat <id|username> --id <msgId> [--source archive|live|both]\n` +
-    `  messages context --chat <id|username> --id <msgId> [--before N] [--after N] [--source archive|live|both]\n` +
-    `  send text --to <id|username> --message "..." [--topic <id>]\n` +
-    `  send file --to <id|username> --file PATH [--caption "..."] [--filename NAME] [--topic <id>]\n` +
-    `  media download --chat <id|username> --id <msgId> [--output PATH]\n` +
-    `  topics list --chat <id|username> [--limit N]\n` +
-    `  topics search --chat <id|username> --query TEXT [--limit N]\n` +
-    `  tags set --chat <id|username> --tags tag1,tag2 [--source manual]\n` +
-    `  tags list --chat <id|username> [--source manual]\n` +
-    `  tags search --tag TAG [--source manual] [--limit N]\n` +
-    `  tags auto [--chat <id|username>] [--limit N] [--source auto] [--no-refresh-metadata]\n` +
-    `  metadata get --chat <id|username>\n` +
-    `  metadata refresh [--chat <id|username>] [--limit N] [--force] [--only-missing]\n` +
-    `  contacts search <query> [--limit N]\n` +
-    `  contacts show --user <id>\n` +
-    `  contacts alias set --user <id> --alias "Name"\n` +
-    `  contacts alias rm --user <id>\n` +
-    `  contacts tags add --user <id> --tag TAG [--tag TAG]\n` +
-    `  contacts tags rm --user <id> --tag TAG [--tag TAG]\n` +
-    `  contacts notes set --user <id> --notes "..." \n` +
-    `  groups list [--query TEXT] [--limit N]\n` +
-    `  groups info --chat <id|username>\n` +
-    `  groups rename --chat <id|username> --name "New Name"\n` +
-    `  groups members add --chat <id|username> --user <id> [--user <id>]\n` +
-    `  groups members remove --chat <id|username> --user <id> [--user <id>]\n` +
-    `  groups invite link get --chat <id|username>\n` +
-    `  groups invite link revoke --chat <id|username>\n` +
-    `  groups join --code <invite-code>\n` +
-    `  groups leave --chat <id|username>\n`;
-  console.log(text);
+const CLI_PROGRAM = buildProgram();
+
+function buildProgram() {
+  const program = new Command();
+  program
+    .name('tgcli')
+    .description('Telegram CLI + MCP server')
+    .usage('[options] <command>')
+    .option('--json', 'Machine-readable output')
+    .option('--timeout <duration>', 'Wall-clock timeout (e.g. 30s, 5m)')
+    .version(readVersion(), '--version', 'Print version and exit')
+    .showHelpAfterError(true);
+
+  const auth = program.command('auth').description('Authentication and session setup');
+  auth
+    .option('--follow', 'Continue syncing after login')
+    .action(withGlobalOptions((globalFlags, options) =>
+      runAuthLogin(globalFlags, options),
+    ));
+  auth
+    .command('status')
+    .description('Show auth status')
+    .action(withGlobalOptions((globalFlags) => runAuthStatus(globalFlags)));
+  auth
+    .command('logout')
+    .description('Log out of Telegram')
+    .action(withGlobalOptions((globalFlags) => runAuthLogout(globalFlags)));
+
+  const sync = program.command('sync').description('Archive backfill and realtime sync');
+  sync
+    .option('--once', 'Run once and exit')
+    .option('--follow', 'Keep syncing realtime updates')
+    .option('--idle-exit <duration>', 'Exit after idle period')
+    .action(withGlobalOptions((globalFlags, options) => runSync(globalFlags, options)));
+  sync
+    .command('status')
+    .description('Show sync status')
+    .action(withGlobalOptions((globalFlags) => runSyncStatus(globalFlags)));
+  const syncJobs = sync.command('jobs').description('Manage sync jobs');
+  syncJobs
+    .command('list')
+    .description('List sync jobs')
+    .option('--status <status>', 'Filter by status (pending|in_progress|idle|error)')
+    .option('--limit <n>', 'Limit results')
+    .option('--channel <id|username>', 'Filter by channel')
+    .action(withGlobalOptions((globalFlags, options) => runSyncJobsList(globalFlags, options)));
+  syncJobs
+    .command('add')
+    .description('Add a sync job')
+    .option('--chat <id|username>', 'Channel identifier')
+    .option('--depth <n>', 'Maximum messages to backfill')
+    .option('--min-date <iso>', 'Earliest date to backfill')
+    .action(withGlobalOptions((globalFlags, options) => runSyncJobsAdd(globalFlags, options)));
+  syncJobs
+    .command('retry')
+    .description('Retry failed jobs')
+    .option('--job-id <n>', 'Retry by job id')
+    .option('--channel <id|username>', 'Retry by channel')
+    .option('--all-errors', 'Retry all error jobs')
+    .action(withGlobalOptions((globalFlags, options) => runSyncJobsRetry(globalFlags, options)));
+  syncJobs
+    .command('cancel')
+    .description('Cancel jobs')
+    .option('--job-id <n>', 'Cancel by job id')
+    .option('--channel <id|username>', 'Cancel by channel')
+    .action(withGlobalOptions((globalFlags, options) => runSyncJobsCancel(globalFlags, options)));
+
+  program
+    .command('server')
+    .description('Run MCP server')
+    .action(withGlobalOptions((globalFlags) => runServer(globalFlags)));
+
+  program
+    .command('doctor')
+    .description('Diagnostics and sanity checks')
+    .option('--connect', 'Connect to Telegram for live checks')
+    .action(withGlobalOptions((globalFlags, options) => runDoctor(globalFlags, options)));
+
+  const channels = program.command('channels').description('Channel discovery and settings');
+  channels
+    .command('list')
+    .description('List channels')
+    .option('--query <text>', 'Search by title or username')
+    .option('--limit <n>', 'Limit results')
+    .action(withGlobalOptions((globalFlags, options) => runChannelsList(globalFlags, options)));
+  channels
+    .command('show')
+    .description('Show channel info')
+    .option('--chat <id|username>', 'Channel identifier')
+    .action(withGlobalOptions((globalFlags, options) => runChannelsShow(globalFlags, options)));
+  channels
+    .command('sync')
+    .description('Enable or disable sync')
+    .option('--chat <id|username>', 'Channel identifier')
+    .option('--enable', 'Enable sync')
+    .option('--disable', 'Disable sync')
+    .action(withGlobalOptions((globalFlags, options) => runChannelsSync(globalFlags, options)));
+
+  const messages = program.command('messages').description('List and search messages');
+  messages
+    .command('list')
+    .description('List messages')
+    .option('--chat <id|username>', 'Channel identifier', collectList)
+    .option('--topic <id>', 'Forum topic id')
+    .option('--source <source>', 'archive|live|both')
+    .option('--after <iso>', 'Filter messages after date')
+    .option('--before <iso>', 'Filter messages before date')
+    .option('--limit <n>', 'Limit results')
+    .action(withGlobalOptions((globalFlags, options) => runMessagesList(globalFlags, options)));
+  messages
+    .command('search')
+    .description('Search messages')
+    .argument('[query...]')
+    .option('--query <text>', 'Search query')
+    .option('--chat <id|username>', 'Channel identifier', collectList)
+    .option('--topic <id>', 'Forum topic id')
+    .option('--source <source>', 'archive|live|both')
+    .option('--after <iso>', 'Filter messages after date')
+    .option('--before <iso>', 'Filter messages before date')
+    .option('--limit <n>', 'Limit results')
+    .option('--regex <pattern>', 'Regex pattern')
+    .option('--tag <tag>', 'Filter by tag', collectList)
+    .option('--tags <tags>', 'Comma-separated tags')
+    .option('--case-sensitive', 'Disable case-insensitive search')
+    .action(withGlobalOptions((globalFlags, queryParts, options) =>
+      runMessagesSearch(globalFlags, queryParts, options),
+    ));
+  messages
+    .command('show')
+    .description('Show a message')
+    .option('--chat <id|username>', 'Channel identifier')
+    .option('--id <msgId>', 'Message id')
+    .option('--source <source>', 'archive|live|both')
+    .action(withGlobalOptions((globalFlags, options) => runMessagesShow(globalFlags, options)));
+  messages
+    .command('context')
+    .description('Show message context')
+    .option('--chat <id|username>', 'Channel identifier')
+    .option('--id <msgId>', 'Message id')
+    .option('--source <source>', 'archive|live|both')
+    .option('--before <n>', 'Messages before')
+    .option('--after <n>', 'Messages after')
+    .action(withGlobalOptions((globalFlags, options) => runMessagesContext(globalFlags, options)));
+
+  const send = program.command('send').description('Send text or files');
+  send
+    .command('text')
+    .description('Send a text message')
+    .option('--to <id|username>', 'Recipient id or username')
+    .option('--message <text>', 'Message text')
+    .option('--topic <id>', 'Forum topic id')
+    .action(withGlobalOptions((globalFlags, options) => runSendText(globalFlags, options)));
+  send
+    .command('file')
+    .description('Send a file')
+    .option('--to <id|username>', 'Recipient id or username')
+    .option('--file <path>', 'File path')
+    .option('--caption <text>', 'Optional caption')
+    .option('--filename <name>', 'Override filename')
+    .option('--topic <id>', 'Forum topic id')
+    .action(withGlobalOptions((globalFlags, options) => runSendFile(globalFlags, options)));
+
+  const media = program.command('media').description('Download media');
+  media
+    .command('download')
+    .description('Download message media')
+    .option('--chat <id|username>', 'Channel identifier')
+    .option('--id <msgId>', 'Message id')
+    .option('--output <path>', 'Output file path')
+    .action(withGlobalOptions((globalFlags, options) => runMediaDownload(globalFlags, options)));
+
+  const topics = program.command('topics').description('Forum topics');
+  topics
+    .command('list')
+    .description('List topics')
+    .option('--chat <id|username>', 'Channel identifier')
+    .option('--limit <n>', 'Limit results')
+    .action(withGlobalOptions((globalFlags, options) => runTopicsList(globalFlags, options)));
+  topics
+    .command('search')
+    .description('Search topics')
+    .option('--chat <id|username>', 'Channel identifier')
+    .option('--query <text>', 'Search query')
+    .option('--limit <n>', 'Limit results')
+    .action(withGlobalOptions((globalFlags, options) => runTopicsSearch(globalFlags, options)));
+
+  const tags = program.command('tags').description('Channel tags');
+  tags
+    .command('set')
+    .description('Set channel tags')
+    .option('--chat <id|username>', 'Channel identifier')
+    .option('--tags <tags>', 'Comma-separated tags')
+    .option('--tag <tag>', 'Tag', collectList)
+    .option('--source <source>', 'Tag source')
+    .action(withGlobalOptions((globalFlags, options) => runTagsSet(globalFlags, options)));
+  tags
+    .command('list')
+    .description('List channel tags')
+    .option('--chat <id|username>', 'Channel identifier')
+    .option('--source <source>', 'Tag source')
+    .action(withGlobalOptions((globalFlags, options) => runTagsList(globalFlags, options)));
+  tags
+    .command('search')
+    .description('Search channels by tag')
+    .option('--tag <tag>', 'Tag to search')
+    .option('--source <source>', 'Tag source')
+    .option('--limit <n>', 'Limit results')
+    .action(withGlobalOptions((globalFlags, options) => runTagsSearch(globalFlags, options)));
+  tags
+    .command('auto')
+    .description('Auto-tag channels')
+    .option('--chat <id|username>', 'Channel identifier', collectList)
+    .option('--limit <n>', 'Limit channels')
+    .option('--source <source>', 'Tag source')
+    .option('--no-refresh-metadata', 'Skip metadata refresh')
+    .action(withGlobalOptions((globalFlags, options) => runTagsAuto(globalFlags, options)));
+
+  const metadata = program.command('metadata').description('Channel metadata cache');
+  metadata
+    .command('get')
+    .description('Show cached metadata')
+    .option('--chat <id|username>', 'Channel identifier')
+    .action(withGlobalOptions((globalFlags, options) => runMetadataGet(globalFlags, options)));
+  metadata
+    .command('refresh')
+    .description('Refresh cached metadata')
+    .option('--chat <id|username>', 'Channel identifier', collectList)
+    .option('--limit <n>', 'Limit channels')
+    .option('--force', 'Force refresh')
+    .option('--only-missing', 'Only refresh missing metadata')
+    .action(withGlobalOptions((globalFlags, options) => runMetadataRefresh(globalFlags, options)));
+
+  const contacts = program.command('contacts').description('Contacts and people');
+  contacts
+    .command('search')
+    .description('Search contacts')
+    .argument('<query...>')
+    .option('--limit <n>', 'Limit results')
+    .action(withGlobalOptions((globalFlags, queryParts, options) =>
+      runContactsSearch(globalFlags, queryParts, options),
+    ));
+  contacts
+    .command('show')
+    .description('Show contact profile')
+    .option('--user <id>', 'User id')
+    .action(withGlobalOptions((globalFlags, options) => runContactsShow(globalFlags, options)));
+  const contactAlias = contacts.command('alias').description('Manage contact aliases');
+  contactAlias
+    .command('set')
+    .description('Set contact alias')
+    .option('--user <id>', 'User id')
+    .option('--alias <name>', 'Alias')
+    .action(withGlobalOptions((globalFlags, options) => runContactsAliasSet(globalFlags, options)));
+  contactAlias
+    .command('rm')
+    .description('Remove contact alias')
+    .option('--user <id>', 'User id')
+    .action(withGlobalOptions((globalFlags, options) => runContactsAliasRm(globalFlags, options)));
+  const contactTags = contacts.command('tags').description('Manage contact tags');
+  contactTags
+    .command('add')
+    .description('Add contact tags')
+    .option('--user <id>', 'User id')
+    .option('--tag <tag>', 'Tag', collectList)
+    .action(withGlobalOptions((globalFlags, options) => runContactsTagsAdd(globalFlags, options)));
+  contactTags
+    .command('rm')
+    .description('Remove contact tags')
+    .option('--user <id>', 'User id')
+    .option('--tag <tag>', 'Tag', collectList)
+    .action(withGlobalOptions((globalFlags, options) => runContactsTagsRm(globalFlags, options)));
+  const contactNotes = contacts.command('notes').description('Manage contact notes');
+  contactNotes
+    .command('set')
+    .description('Set contact notes')
+    .option('--user <id>', 'User id')
+    .option('--notes <text>', 'Notes')
+    .action(withGlobalOptions((globalFlags, options) => runContactsNotesSet(globalFlags, options)));
+
+  const groups = program.command('groups').description('Group management');
+  groups
+    .command('list')
+    .description('List groups')
+    .option('--query <text>', 'Search by title')
+    .option('--limit <n>', 'Limit results')
+    .action(withGlobalOptions((globalFlags, options) => runGroupsList(globalFlags, options)));
+  groups
+    .command('info')
+    .description('Show group info')
+    .option('--chat <id|username>', 'Group identifier')
+    .action(withGlobalOptions((globalFlags, options) => runGroupsInfo(globalFlags, options)));
+  groups
+    .command('rename')
+    .description('Rename group')
+    .option('--chat <id|username>', 'Group identifier')
+    .option('--name <text>', 'New name')
+    .action(withGlobalOptions((globalFlags, options) => runGroupsRename(globalFlags, options)));
+  const groupMembers = groups.command('members').description('Manage group members');
+  groupMembers
+    .command('add')
+    .description('Add members')
+    .option('--chat <id|username>', 'Group identifier')
+    .option('--user <id>', 'User id', collectList)
+    .action(withGlobalOptions((globalFlags, options) => runGroupMembersAdd(globalFlags, options)));
+  groupMembers
+    .command('remove')
+    .description('Remove members')
+    .option('--chat <id|username>', 'Group identifier')
+    .option('--user <id>', 'User id', collectList)
+    .action(withGlobalOptions((globalFlags, options) => runGroupMembersRemove(globalFlags, options)));
+  const groupInvite = groups.command('invite').description('Manage invite links');
+  const groupInviteLink = groupInvite.command('link').description('Invite links');
+  groupInviteLink
+    .command('get')
+    .description('Get invite link')
+    .option('--chat <id|username>', 'Group identifier')
+    .action(withGlobalOptions((globalFlags, options) => runGroupInviteLinkGet(globalFlags, options)));
+  groupInviteLink
+    .command('revoke')
+    .description('Revoke invite link')
+    .option('--chat <id|username>', 'Group identifier')
+    .action(withGlobalOptions((globalFlags, options) => runGroupInviteLinkRevoke(globalFlags, options)));
+  groups
+    .command('join')
+    .description('Join via invite code')
+    .option('--code <invite-code>', 'Invite code')
+    .action(withGlobalOptions((globalFlags, options) => runGroupsJoin(globalFlags, options)));
+  groups
+    .command('leave')
+    .description('Leave group')
+    .option('--chat <id|username>', 'Group identifier')
+    .action(withGlobalOptions((globalFlags, options) => runGroupsLeave(globalFlags, options)));
+
+  disableHelpCommand(program);
+  program.addHelpText('after', '\nUse "tgcli [command] --help" for more information about a command.');
+  program.action(() => {
+    program.help();
+  });
+  return program;
+}
+
+function disableHelpCommand(command) {
+  command.addHelpCommand(false);
+  for (const subcommand of command.commands) {
+    disableHelpCommand(subcommand);
+  }
+}
+
+function getGlobalFlags(command) {
+  const options = command.optsWithGlobals();
+  const timeoutMs = options.timeout ? parseDuration(options.timeout) : null;
+  return {
+    json: Boolean(options.json),
+    timeout: options.timeout ?? null,
+    timeoutMs,
+  };
+}
+
+function withGlobalOptions(handler) {
+  return async (...args) => {
+    let globalFlags;
+    try {
+      const command = args[args.length - 1];
+      globalFlags = getGlobalFlags(command);
+      await handler(globalFlags, ...args);
+    } catch (error) {
+      writeError(error, globalFlags?.json ?? process.argv.includes('--json'));
+      process.exitCode = 1;
+    }
+  };
 }
 
 function writeJson(payload) {
@@ -173,90 +493,6 @@ async function ensureStoreConfig(storeDir) {
   return normalized;
 }
 
-function parseGlobalFlags(args) {
-  const flags = {
-    json: false,
-    help: false,
-    version: false,
-    timeout: null,
-  };
-  const rest = [];
-  for (let i = 0; i < args.length; i += 1) {
-    const arg = args[i];
-    if (!arg.startsWith('-')) {
-      rest.push(...args.slice(i));
-      break;
-    }
-    if (arg === '--json') {
-      flags.json = true;
-      continue;
-    }
-    if (arg === '--help' || arg === '-h') {
-      flags.help = true;
-      continue;
-    }
-    if (arg === '--version') {
-      flags.version = true;
-      continue;
-    }
-    if (arg === '--timeout') {
-      const next = args[i + 1];
-      if (!next) {
-        throw new Error('--timeout requires a value');
-      }
-      flags.timeout = next;
-      i += 1;
-      continue;
-    }
-    if (arg.startsWith('--timeout=')) {
-      flags.timeout = arg.slice('--timeout='.length);
-      continue;
-    }
-    rest.push(...args.slice(i));
-    break;
-  }
-  return { flags, rest };
-}
-
-function parseFlags(args, spec) {
-  const flags = {};
-  const rest = [];
-  for (let i = 0; i < args.length; i += 1) {
-    const arg = args[i];
-    if (!arg.startsWith('--')) {
-      rest.push(arg);
-      continue;
-    }
-    const [rawKey, rawValue] = arg.split('=');
-    const key = rawKey.slice(2);
-    const rule = spec[key];
-    if (!rule) {
-      rest.push(arg);
-      continue;
-    }
-    if (rule.type === 'boolean') {
-      flags[key] = true;
-      continue;
-    }
-    const value = rawValue ?? args[i + 1];
-    if (value === undefined) {
-      throw new Error(`--${key} requires a value`);
-    }
-    if (!rawValue) {
-      i += 1;
-    }
-    if (rule.multiple) {
-      if (!flags[key]) {
-        flags[key] = [];
-      }
-      flags[key].push(value);
-    } else {
-      flags[key] = value;
-    }
-  }
-  return { flags, rest };
-}
-
 function parsePositiveInt(value, label) {
   if (value === undefined || value === null || value === '') {
     return null;
@@ -277,6 +513,12 @@ function parseNonNegativeInt(value, label) {
     throw new Error(`${label} must be a non-negative number`);
   }
   return parsed;
+}
+
+function collectList(value, previous) {
+  const list = previous ?? [];
+  list.push(value);
+  return list;
 }
 
 function parseListValues(value) {
@@ -422,85 +664,86 @@ async function waitForIdle(service, idleExitMs) {
   }
 }
 
-async function runAuth(globalFlags, args) {
+async function runAuthStatus(globalFlags) {
   const timeoutMs = globalFlags.timeoutMs;
   return runWithTimeout(async () => {
-    const { flags, rest } = parseFlags(args, {
-      follow: { type: 'boolean' },
-    });
-    const subcommand = rest[0];
     const storeDir = resolveStoreDir();
-
-    if (subcommand === 'status') {
-      const { config, missing } = getStoreConfig(storeDir);
-      if (missing.length > 0) {
-        if (globalFlags.json) {
-          writeJson({ authenticated: false, configured: false });
-        } else {
+    const { config, missing } = getStoreConfig(storeDir);
+    if (missing.length > 0) {
+      if (globalFlags.json) {
+        writeJson({ authenticated: false, configured: false });
+      } else {
+        console.log('Not authenticated. Run `tgcli auth`.');
+      }
+      return;
+    }
+    const { telegramClient, messageSyncService } = createServices({ storeDir, config });
+    try {
+      const me = await telegramClient.getCurrentUser();
+      const authenticated = Boolean(me);
+      const search = messageSyncService.getSearchStatus();
+      const username = me?.username ? `@${me.username}` : null;
+      const payload = {
+        authenticated,
+        configured: true,
+        phoneNumber: config.phoneNumber || null,
+        username: me?.username ?? null,
+        ftsEnabled: search.enabled,
+      };
+      if (globalFlags.json) {
+        writeJson(payload);
+      } else {
+        if (!authenticated) {
           console.log('Not authenticated. Run `tgcli auth`.');
-        }
-        return;
-      }
-      const { telegramClient, messageSyncService } = createServices({ storeDir, config });
-      try {
-        const me = await telegramClient.getCurrentUser();
-        const authenticated = Boolean(me);
-        const search = messageSyncService.getSearchStatus();
-        const username = me?.username ? `@${me.username}` : null;
-        const payload = {
-          authenticated,
-          configured: true,
-          phoneNumber: config.phoneNumber || null,
-          username: me?.username ?? null,
-          ftsEnabled: search.enabled,
-        };
-        if (globalFlags.json) {
-          writeJson(payload);
+        } else if (username) {
+          console.log(`Authenticated as ${config.phoneNumber} (${username}).`);
         } else {
-          if (!authenticated) {
-            console.log('Not authenticated. Run `tgcli auth`.');
-          } else if (username) {
-            console.log(`Authenticated as ${config.phoneNumber} (${username}).`);
-          } else {
-            console.log(`Authenticated as ${config.phoneNumber}.`);
-          }
+          console.log(`Authenticated as ${config.phoneNumber}.`);
         }
-      } finally {
-        await messageSyncService.shutdown();
-        await telegramClient.destroy();
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+    }
+  }, timeoutMs);
+}
+
+async function runAuthLogout(globalFlags) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    const storeDir = resolveStoreDir();
+    const { missing } = getStoreConfig(storeDir);
+    if (missing.length > 0) {
+      if (globalFlags.json) {
+        writeJson({ loggedOut: false, configured: false });
+      } else {
+        console.log('Not authenticated.');
       }
       return;
     }
-
-    if (subcommand === 'logout') {
-      const { missing } = getStoreConfig(storeDir);
-      if (missing.length > 0) {
-        if (globalFlags.json) {
-          writeJson({ loggedOut: false, configured: false });
-        } else {
-          console.log('Not authenticated.');
-        }
-        return;
+    const release = acquireStoreLock(storeDir);
+    const config = await ensureStoreConfig(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir, config });
+    try {
+      await telegramClient.login();
+      await telegramClient.client.logout();
+      if (globalFlags.json) {
+        writeJson({ loggedOut: true });
+      } else {
+        console.log('Logged out.');
       }
-      const release = acquireStoreLock(storeDir);
-      const config = await ensureStoreConfig(storeDir);
-      const { telegramClient, messageSyncService } = createServices({ storeDir, config });
-      try {
-        await telegramClient.login();
-        await telegramClient.client.logout();
-        if (globalFlags.json) {
-          writeJson({ loggedOut: true });
-        } else {
-          console.log('Logged out.');
-        }
-      } finally {
-        await messageSyncService.shutdown();
-        await telegramClient.destroy();
-        release();
-      }
-      return;
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
     }
+  }, timeoutMs);
+}
 
+async function runAuthLogin(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    const storeDir = resolveStoreDir();
     const release = acquireStoreLock(storeDir);
     const config = await ensureStoreConfig(storeDir);
     const { telegramClient, messageSyncService } = createServices({ storeDir, config });
@@ -510,7 +753,7 @@ async function runAuth(globalFlags, args) {
         throw new Error('Failed to login to Telegram.');
       }
       const dialogCount = await messageSyncService.refreshChannelsFromDialogs();
-      if (flags.follow) {
+      if (options.follow) {
         await telegramClient.startUpdates();
         messageSyncService.startRealtimeSync();
         messageSyncService.resumePendingJobs();
@@ -528,7 +771,7 @@ async function runAuth(globalFlags, args) {
         console.log(`Authenticated. Seeded ${dialogCount} dialogs.`);
       }
     } finally {
-      if (!flags.follow) {
+      if (!options.follow) {
         await messageSyncService.shutdown();
         await telegramClient.destroy();
         release();
@@ -537,19 +780,14 @@ async function runAuth(globalFlags, args) {
   }, timeoutMs);
 }
 
-async function runSync(globalFlags, args) {
+async function runSync(globalFlags, options = {}) {
   const timeoutMs = globalFlags.timeoutMs;
   return runWithTimeout(async () => {
-    const { flags } = parseFlags(args, {
-      once: { type: 'boolean' },
-      follow: { type: 'boolean' },
-      'idle-exit': { type: 'string' },
-    });
     const storeDir = resolveStoreDir();
     const release = acquireStoreLock(storeDir);
     const { telegramClient, messageSyncService } = createServices({ storeDir });
-    const idleExitMs = parseDuration(flags['idle-exit'] || '30s');
-    const follow = flags.follow || !flags.once;
+    const idleExitMs = parseDuration(options.idleExit || '30s');
+    const follow = options.follow || !options.once;
 
     try {
       if (!(await telegramClient.isAuthorized().catch(() => false))) {
@@ -661,136 +899,61 @@ async function runSyncStatus(globalFlags) {
   }, timeoutMs);
 }
 
-async function runSyncJobs(globalFlags, args) {
+async function runSyncJobsList(globalFlags, options = {}) {
   const timeoutMs = globalFlags.timeoutMs;
   return runWithTimeout(async () => {
-    const [mode, ...rest] = args;
-    if (!mode) {
-      throw new Error('sync jobs requires a subcommand: list | add | retry | cancel');
-    }
-
     const storeDir = resolveStoreDir();
-
-    if (mode === 'list') {
-      const { flags } = parseFlags(rest, {
-        status: { type: 'string' },
-        limit: { type: 'string' },
-        channel: { type: 'string' },
-      });
-      const status = flags.status ? String(flags.status) : null;
-      if (status && !['pending', 'in_progress', 'idle', 'error'].includes(status)) {
-        throw new Error(`Unknown status: ${status}`);
-      }
-      const limit = parsePositiveInt(flags.limit, '--limit') ?? 100;
-      const { telegramClient, messageSyncService } = createServices({ storeDir });
-      try {
-        const jobs = messageSyncService.listJobs({
-          status,
-          channelId: flags.channel,
-          limit,
-        });
-        if (globalFlags.json) {
-          writeJson(jobs);
-        } else {
-          for (const job of jobs) {
-            const label = job.peer_title || job.channel_id;
-            console.log(`#${job.id} ${label} [${job.status}] ${job.message_count}/${job.target_message_count}`);
-          }
-        }
-      } finally {
-        await messageSyncService.shutdown();
-        await telegramClient.destroy();
-      }
-      return;
+    const status = options.status ? String(options.status) : null;
+    if (status && !['pending', 'in_progress', 'idle', 'error'].includes(status)) {
+      throw new Error(`Unknown status: ${status}`);
     }
+    const limit = parsePositiveInt(options.limit, '--limit') ?? 100;
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    try {
+      const jobs = messageSyncService.listJobs({
+        status,
+        channelId: options.channel ?? null,
+        limit,
+      });
+      if (globalFlags.json) {
+        writeJson(jobs);
+      } else {
+        for (const job of jobs) {
+          const label = job.peer_title || job.channel_id;
+          console.log(`#${job.id} ${label} [${job.status}] ${job.message_count}/${job.target_message_count}`);
+        }
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+    }
+  }, timeoutMs);
+}
 
+async function runSyncJobsAdd(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.chat) {
+      throw new Error('--chat is required');
+    }
+    const storeDir = resolveStoreDir();
     const release = acquireStoreLock(storeDir);
     const { telegramClient, messageSyncService } = createServices({ storeDir });
     try {
-      if (mode === 'add') {
-        const { flags } = parseFlags(rest, {
-          chat: { type: 'string' },
-          depth: { type: 'string' },
-          'min-date': { type: 'string' },
-        });
-        if (!flags.chat) {
-          throw new Error('--chat is required');
-        }
-        if (!(await telegramClient.isAuthorized().catch(() => false))) {
-          throw new Error('Not authenticated. Run `node cli.js auth` first.');
-        }
-        const depth = parsePositiveInt(flags.depth, '--depth');
-        const job = messageSyncService.addJob(flags.chat, {
-          depth,
-          minDate: flags['min-date'],
-        });
-        void messageSyncService.processQueue();
-        if (globalFlags.json) {
-          writeJson(job);
-        } else {
-          console.log(`Job scheduled for ${job.channel_id} (#${job.id}).`);
-        }
-        return;
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `node cli.js auth` first.');
       }
-
-      if (mode === 'retry') {
-        const { flags } = parseFlags(rest, {
-          'job-id': { type: 'string' },
-          channel: { type: 'string' },
-          'all-errors': { type: 'boolean' },
-        });
-        const jobId = parsePositiveInt(flags['job-id'], '--job-id');
-        const channelId = flags.channel || null;
-        const allErrors = Boolean(flags['all-errors']);
-        if (!jobId && !channelId && !allErrors) {
-          throw new Error('--job-id, --channel, or --all-errors is required');
-        }
-        if (allErrors && (jobId || channelId)) {
-          throw new Error('Use --all-errors without --job-id/--channel');
-        }
-        const result = messageSyncService.retryJobs({
-          jobId,
-          channelId,
-          allErrors,
-        });
-        const authed = await telegramClient.isAuthorized().catch(() => false);
-        if (authed && result.updated > 0) {
-          void messageSyncService.processQueue();
-        }
-        if (globalFlags.json) {
-          writeJson(result);
-        } else {
-          console.log(`Re-queued ${result.updated} job(s).`);
-        }
-        return;
+      const depth = parsePositiveInt(options.depth, '--depth');
+      const job = messageSyncService.addJob(options.chat, {
+        depth,
+        minDate: options.minDate ?? null,
+      });
+      void messageSyncService.processQueue();
+      if (globalFlags.json) {
+        writeJson(job);
+      } else {
+        console.log(`Job scheduled for ${job.channel_id} (#${job.id}).`);
       }
-
-      if (mode === 'cancel') {
-        const { flags } = parseFlags(rest, {
-          'job-id': { type: 'string' },
-          channel: { type: 'string' },
-        });
-        const jobId = parsePositiveInt(flags['job-id'], '--job-id');
-        const channelId = flags.channel || null;
-        if (!jobId && !channelId) {
-          throw new Error('--job-id or --channel is required');
-        }
-        if (jobId && channelId) {
-          throw new Error('Use --job-id or --channel, not both');
-        }
-        const result = messageSyncService.cancelJobs({
-          jobId,
-          channelId,
-        });
-        if (globalFlags.json) {
-          writeJson(result);
-        } else {
-          console.log(`Canceled ${result.canceled} job(s).`);
-        }
-        return;
-      }
-
-      throw new Error(`Unknown sync jobs subcommand: ${mode}`);
     } finally {
       await messageSyncService.shutdown();
       await telegramClient.destroy();
@@ -799,12 +962,79 @@ async function runSyncJobs(globalFlags, args) {
   }, timeoutMs);
 }
 
-async function runDoctor(globalFlags, args) {
+async function runSyncJobsRetry(globalFlags, options = {}) {
   const timeoutMs = globalFlags.timeoutMs;
   return runWithTimeout(async () => {
-    const { flags } = parseFlags(args, {
-      connect: { type: 'boolean' },
-    });
+    const jobId = parsePositiveInt(options.jobId, '--job-id');
+    const channelId = options.channel ?? null;
+    const allErrors = Boolean(options.allErrors);
+    if (!jobId && !channelId && !allErrors) {
+      throw new Error('--job-id, --channel, or --all-errors is required');
+    }
+    if (allErrors && (jobId || channelId)) {
+      throw new Error('Use --all-errors without --job-id/--channel');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    try {
+      const result = messageSyncService.retryJobs({
+        jobId,
+        channelId,
+        allErrors,
+      });
+      const authed = await telegramClient.isAuthorized().catch(() => false);
+      if (authed && result.updated > 0) {
+        void messageSyncService.processQueue();
+      }
+      if (globalFlags.json) {
+        writeJson(result);
+      } else {
+        console.log(`Re-queued ${result.updated} job(s).`);
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runSyncJobsCancel(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    const jobId = parsePositiveInt(options.jobId, '--job-id');
+    const channelId = options.channel ?? null;
+    if (!jobId && !channelId) {
+      throw new Error('--job-id or --channel is required');
+    }
+    if (jobId && channelId) {
+      throw new Error('Use --job-id or --channel, not both');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    try {
+      const result = messageSyncService.cancelJobs({
+        jobId,
+        channelId,
+      });
+      if (globalFlags.json) {
+        writeJson(result);
+      } else {
+        console.log(`Canceled ${result.canceled} job(s).`);
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runDoctor(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
     const storeDir = resolveStoreDir();
     const lock = readStoreLock(storeDir);
     const { telegramClient, messageSyncService } = createServices({ storeDir });
@@ -813,7 +1043,7 @@ async function runDoctor(globalFlags, args) {
       let connected = false;
       try {
         authenticated = await telegramClient.isAuthorized();
-        if (flags.connect && authenticated) {
+        if (options.connect && authenticated) {
           await telegramClient.startUpdates();
           connected = true;
         }
@@ -853,113 +1083,29 @@ async function runDoctor(globalFlags, args) {
   }, timeoutMs);
 }
 
-async function runChannels(globalFlags, args) {
+async function runChannelsList(globalFlags, options = {}) {
   const timeoutMs = globalFlags.timeoutMs;
   return runWithTimeout(async () => {
-    const [mode, ...rest] = args;
-    if (!mode) {
-      throw new Error('channels requires a subcommand');
-    }
-
     const storeDir = resolveStoreDir();
     const release = acquireStoreLock(storeDir);
     const { telegramClient, messageSyncService } = createServices({ storeDir });
-
     try {
-      if (mode === 'list') {
-        const { flags } = parseFlags(rest, {
-          query: { type: 'string' },
-          limit: { type: 'string' },
-        });
-        const limit = parsePositiveInt(flags.limit, '--limit') ?? 50;
-        if (!(await telegramClient.isAuthorized().catch(() => false))) {
-          throw new Error('Not authenticated. Run `node cli.js auth` first.');
-        }
-        const dialogs = flags.query
-          ? await telegramClient.searchDialogs(flags.query, limit)
-          : await telegramClient.listDialogs(limit);
-
-        if (globalFlags.json) {
-          writeJson(dialogs);
-        } else {
-          for (const dialog of dialogs) {
-            const label = dialog.title || dialog.username || dialog.id;
-            console.log(`${label} (${dialog.id})`);
-          }
-        }
-        return;
+      const limit = parsePositiveInt(options.limit, '--limit') ?? 50;
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `node cli.js auth` first.');
       }
+      const dialogs = options.query
+        ? await telegramClient.searchDialogs(options.query, limit)
+        : await telegramClient.listDialogs(limit);
 
-      if (mode === 'show') {
-        const { flags } = parseFlags(rest, {
-          chat: { type: 'string' },
-        });
-        if (!flags.chat) {
-          throw new Error('--chat is required');
+      if (globalFlags.json) {
+        writeJson(dialogs);
+      } else {
+        for (const dialog of dialogs) {
+          const label = dialog.title || dialog.username || dialog.id;
+          console.log(`${label} (${dialog.id})`);
         }
-
-        let channel = messageSyncService.getChannel(flags.chat);
-        if (!channel) {
-          if (!(await telegramClient.isAuthorized().catch(() => false))) {
-            throw new Error('Not authenticated. Run `node cli.js auth` first.');
-          }
-          const meta = await telegramClient.getPeerMetadata(flags.chat);
-          channel = {
-            channelId: String(flags.chat),
-            peerTitle: meta?.peerTitle ?? null,
-            peerType: meta?.peerType ?? null,
-            chatType: meta?.chatType ?? null,
-            isForum: meta?.isForum ?? null,
-            username: meta?.username ?? null,
-            syncEnabled: null,
-            lastMessageId: null,
-            lastMessageDate: null,
-            oldestMessageId: null,
-            oldestMessageDate: null,
-            about: meta?.about ?? null,
-            metadataUpdatedAt: null,
-            createdAt: null,
-            updatedAt: null,
-            source: 'live',
-          };
-        }
-
-        if (globalFlags.json) {
-          writeJson(channel);
-        } else {
-          console.log(JSON.stringify(channel, null, 2));
-        }
-        return;
       }
-
-      if (mode === 'sync') {
-        const { flags } = parseFlags(rest, {
-          chat: { type: 'string' },
-          enable: { type: 'boolean' },
-          disable: { type: 'boolean' },
-        });
-        if (!flags.chat) {
-          throw new Error('--chat is required');
-        }
-        if (flags.enable && flags.disable) {
-          throw new Error('Use either --enable or --disable');
-        }
-        if (!flags.enable && !flags.disable) {
-          throw new Error('--enable or --disable is required');
-        }
-        const result = messageSyncService.setChannelSync(flags.chat, Boolean(flags.enable));
-        if (globalFlags.json) {
-          writeJson({
-            channelId: result.channel_id,
-            syncEnabled: Boolean(result.sync_enabled),
-          });
-        } else {
-          console.log(`Sync ${result.sync_enabled ? 'enabled' : 'disabled'} for ${result.channel_id}`);
-        }
-        return;
-      }
-
-      throw new Error(`Unknown channels subcommand: ${mode}`);
     } finally {
       await messageSyncService.shutdown();
       await telegramClient.destroy();
@@ -968,19 +1114,90 @@ async function runChannels(globalFlags, args) {
   }, timeoutMs);
 }
 
-async function runMessages(globalFlags, args) {
+async function runChannelsShow(globalFlags, options = {}) {
   const timeoutMs = globalFlags.timeoutMs;
   return runWithTimeout(async () => {
-    const [mode, ...rest] = args;
-    if (!mode) {
-      throw new Error('messages requires a subcommand: list | search | show | context');
+    if (!options.chat) {
+      throw new Error('--chat is required');
     }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    try {
+      let channel = messageSyncService.getChannel(options.chat);
+      if (!channel) {
+        if (!(await telegramClient.isAuthorized().catch(() => false))) {
+          throw new Error('Not authenticated. Run `node cli.js auth` first.');
+        }
+        const meta = await telegramClient.getPeerMetadata(options.chat);
+        channel = {
+          channelId: String(options.chat),
+          peerTitle: meta?.peerTitle ?? null,
+          peerType: meta?.peerType ?? null,
+          chatType: meta?.chatType ?? null,
+          isForum: meta?.isForum ?? null,
+          username: meta?.username ?? null,
+          syncEnabled: null,
+          lastMessageId: null,
+          lastMessageDate: null,
+          oldestMessageId: null,
+          oldestMessageDate: null,
+          about: meta?.about ?? null,
+          metadataUpdatedAt: null,
+          createdAt: null,
+          updatedAt: null,
+          source: 'live',
+        };
+      }
 
-  const storeDir = resolveStoreDir();
-  const release = acquireStoreLock(storeDir);
-  const { telegramClient, messageSyncService } = createServices({ storeDir });
+      if (globalFlags.json) {
+        writeJson(channel);
+      } else {
+        console.log(JSON.stringify(channel, null, 2));
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
 
-  const resolveLiveMetadata = async (channelId, fallback = {}) => {
+async function runChannelsSync(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.chat) {
+      throw new Error('--chat is required');
+    }
+    if (options.enable && options.disable) {
+      throw new Error('Use either --enable or --disable');
+    }
+    if (!options.enable && !options.disable) {
+      throw new Error('--enable or --disable is required');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    try {
+      const result = messageSyncService.setChannelSync(options.chat, Boolean(options.enable));
+      if (globalFlags.json) {
+        writeJson({
+          channelId: result.channel_id,
+          syncEnabled: Boolean(result.sync_enabled),
+        });
+      } else {
+        console.log(`Sync ${result.sync_enabled ? 'enabled' : 'disabled'} for ${result.channel_id}`);
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+function createLiveMetadataResolver(messageSyncService, telegramClient) {
+  return async (channelId, fallback = {}) => {
     const meta = messageSyncService.getChannelMetadata(channelId);
     let peerTitle = meta?.peerTitle ?? fallback.peerTitle ?? null;
     let username = meta?.username ?? fallback.username ?? null;
@@ -991,29 +1208,28 @@ async function runMessages(globalFlags, args) {
     }
     return { peerTitle, username };
   };
+}
 
-  try {
-    if (mode === 'list') {
-      const { flags } = parseFlags(rest, {
-        chat: { type: 'string', multiple: true },
-        topic: { type: 'string' },
-        source: { type: 'string' },
-        after: { type: 'string' },
-        before: { type: 'string' },
-        limit: { type: 'string' },
-      });
-      const resolvedSource = resolveSource(flags.source);
-      const channelIds = parseListValues(flags.chat);
-      const topicId = parsePositiveInt(flags.topic, '--topic');
-      const finalLimit = parsePositiveInt(flags.limit, '--limit') ?? 50;
+async function runMessagesList(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    const resolveLiveMetadata = createLiveMetadataResolver(messageSyncService, telegramClient);
+    try {
+      const resolvedSource = resolveSource(options.source);
+      const channelIds = parseListValues(options.chat);
+      const topicId = parsePositiveInt(options.topic, '--topic');
+      const finalLimit = parsePositiveInt(options.limit, '--limit') ?? 50;
       const sets = [];
 
       if (resolvedSource === 'archive' || resolvedSource === 'both') {
         const archived = messageSyncService.listArchivedMessages({
           channelIds: channelIds.length ? channelIds : null,
           topicId,
-          fromDate: flags.after,
-          toDate: flags.before,
+          fromDate: options.after,
+          toDate: options.before,
           limit: finalLimit,
         });
         sets.push(archived.map((message) => ({ ...message, source: 'archive' })));
@@ -1046,7 +1262,7 @@ async function runMessages(globalFlags, args) {
           peerTitle = meta.peerTitle;
           username = meta.username;
 
-          const filtered = filterLiveMessagesByDate(liveMessages, flags.after, flags.before);
+          const filtered = filterLiveMessagesByDate(liveMessages, options.after, options.before);
           const formatted = filtered.map((message) => ({
             ...formatLiveMessage(message, { channelId: String(id), peerTitle, username }),
             source: 'live',
@@ -1070,35 +1286,34 @@ async function runMessages(globalFlags, args) {
           console.log(`${prefix}${message.date ?? ''} ${label} #${message.messageId}: ${text}`);
         }
       }
-      return;
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
     }
+  }, timeoutMs);
+}
 
-    if (mode === 'search') {
-      const { flags, rest: queryParts } = parseFlags(rest, {
-        chat: { type: 'string', multiple: true },
-        topic: { type: 'string' },
-        source: { type: 'string' },
-        after: { type: 'string' },
-        before: { type: 'string' },
-        limit: { type: 'string' },
-        regex: { type: 'string' },
-        tag: { type: 'string', multiple: true },
-        tags: { type: 'string' },
-        query: { type: 'string' },
-        'case-sensitive': { type: 'boolean' },
-      });
-      const query = flags.query || queryParts.join(' ').trim();
-      const resolvedSource = resolveSource(flags.source);
-      const channelIds = parseListValues(flags.chat);
+async function runMessagesSearch(globalFlags, queryParts, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    const resolveLiveMetadata = createLiveMetadataResolver(messageSyncService, telegramClient);
+    try {
+      const query = options.query || (queryParts || []).join(' ').trim();
+      const resolvedSource = resolveSource(options.source);
+      const channelIds = parseListValues(options.chat);
       const tagList = [
-        ...parseListValues(flags.tag),
-        ...parseListValues(flags.tags),
+        ...parseListValues(options.tag),
+        ...parseListValues(options.tags),
       ];
-      const topicId = parsePositiveInt(flags.topic, '--topic');
-      const finalLimit = parsePositiveInt(flags.limit, '--limit') ?? 100;
-      const caseInsensitive = !flags['case-sensitive'];
+      const topicId = parsePositiveInt(options.topic, '--topic');
+      const finalLimit = parsePositiveInt(options.limit, '--limit') ?? 100;
+      const caseInsensitive = !options.caseSensitive;
 
-      if (!query && !flags.regex && tagList.length === 0) {
+      if (!query && !options.regex && tagList.length === 0) {
         throw new Error('Provide query, regex, or tag for messages search.');
       }
 
@@ -1107,12 +1322,12 @@ async function runMessages(globalFlags, args) {
       if (resolvedSource === 'archive' || resolvedSource === 'both') {
         const archived = messageSyncService.searchArchiveMessages({
           query,
-          regex: flags.regex,
+          regex: options.regex,
           tags: tagList.length ? tagList : null,
           channelIds: channelIds.length ? channelIds : null,
           topicId,
-          fromDate: flags.after,
-          toDate: flags.before,
+          fromDate: options.after,
+          toDate: options.before,
           limit: finalLimit,
           caseInsensitive,
         });
@@ -1140,9 +1355,9 @@ async function runMessages(globalFlags, args) {
         }
 
         let liveRegex = null;
-        if (flags.regex) {
+        if (options.regex) {
           try {
-            liveRegex = new RegExp(flags.regex, caseInsensitive ? 'i' : '');
+            liveRegex = new RegExp(options.regex, caseInsensitive ? 'i' : '');
           } catch (error) {
             throw new Error(`Invalid regex: ${error.message}`);
           }
@@ -1175,7 +1390,7 @@ async function runMessages(globalFlags, args) {
           peerTitle = meta.peerTitle;
           username = meta.username;
 
-          let filtered = filterLiveMessagesByDate(liveMessages, flags.after, flags.before);
+          let filtered = filterLiveMessagesByDate(liveMessages, options.after, options.before);
           if (liveRegex) {
             filtered = filtered.filter((message) =>
               liveRegex.test(message.text ?? message.message ?? ''),
@@ -1206,23 +1421,30 @@ async function runMessages(globalFlags, args) {
           console.log(`${prefix}${message.date ?? ''} ${label} #${message.messageId}: ${text}`);
         }
       }
-      return;
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
     }
+  }, timeoutMs);
+}
 
-    if (mode === 'show') {
-      const { flags } = parseFlags(rest, {
-        chat: { type: 'string' },
-        id: { type: 'string' },
-        source: { type: 'string' },
-      });
-      if (!flags.chat) {
-        throw new Error('--chat is required');
-      }
-      if (!flags.id) {
-        throw new Error('--id is required');
-      }
-      const messageId = parsePositiveInt(flags.id, '--id');
-      const resolvedSource = resolveSource(flags.source);
+async function runMessagesShow(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.chat) {
+      throw new Error('--chat is required');
+    }
+    if (!options.id) {
+      throw new Error('--id is required');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    const resolveLiveMetadata = createLiveMetadataResolver(messageSyncService, telegramClient);
+    try {
+      const messageId = parsePositiveInt(options.id, '--id');
+      const resolvedSource = resolveSource(options.source);
       let message = null;
       let resolvedFrom = null;
 
@@ -1230,11 +1452,11 @@ async function runMessages(globalFlags, args) {
         if (!(await telegramClient.isAuthorized().catch(() => false))) {
           throw new Error('Not authenticated. Run `node cli.js auth` first.');
         }
-        const live = await telegramClient.getMessageById(flags.chat, messageId);
+        const live = await telegramClient.getMessageById(options.chat, messageId);
         if (live) {
-          const meta = await resolveLiveMetadata(flags.chat);
+          const meta = await resolveLiveMetadata(options.chat);
           message = {
-            ...formatLiveMessage(live, { channelId: String(flags.chat), ...meta }),
+            ...formatLiveMessage(live, { channelId: String(options.chat), ...meta }),
             source: 'live',
           };
           resolvedFrom = 'live';
@@ -1243,7 +1465,7 @@ async function runMessages(globalFlags, args) {
 
       if (!message && (resolvedSource === 'archive' || resolvedSource === 'both')) {
         const archived = messageSyncService.getArchivedMessage({
-          channelId: flags.chat,
+          channelId: options.chat,
           messageId,
         });
         if (archived) {
@@ -1262,27 +1484,32 @@ async function runMessages(globalFlags, args) {
       } else {
         console.log(JSON.stringify(payload, null, 2));
       }
-      return;
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
     }
+  }, timeoutMs);
+}
 
-    if (mode === 'context') {
-      const { flags } = parseFlags(rest, {
-        chat: { type: 'string' },
-        id: { type: 'string' },
-        source: { type: 'string' },
-        before: { type: 'string' },
-        after: { type: 'string' },
-      });
-      if (!flags.chat) {
-        throw new Error('--chat is required');
-      }
-      if (!flags.id) {
-        throw new Error('--id is required');
-      }
-      const messageId = parsePositiveInt(flags.id, '--id');
-      const resolvedSource = resolveSource(flags.source);
-      const safeBefore = parseNonNegativeInt(flags.before, '--before') ?? 20;
-      const safeAfter = parseNonNegativeInt(flags.after, '--after') ?? 20;
+async function runMessagesContext(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.chat) {
+      throw new Error('--chat is required');
+    }
+    if (!options.id) {
+      throw new Error('--id is required');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    const resolveLiveMetadata = createLiveMetadataResolver(messageSyncService, telegramClient);
+    try {
+      const messageId = parsePositiveInt(options.id, '--id');
+      const resolvedSource = resolveSource(options.source);
+      const safeBefore = parseNonNegativeInt(options.before, '--before') ?? 20;
+      const safeAfter = parseNonNegativeInt(options.after, '--after') ?? 20;
       let context = null;
       let resolvedFrom = null;
 
@@ -1290,23 +1517,23 @@ async function runMessages(globalFlags, args) {
         if (!(await telegramClient.isAuthorized().catch(() => false))) {
           throw new Error('Not authenticated. Run `node cli.js auth` first.');
         }
-        const liveContext = await telegramClient.getMessageContext(flags.chat, messageId, {
+        const liveContext = await telegramClient.getMessageContext(options.chat, messageId, {
           before: safeBefore,
           after: safeAfter,
         });
         if (liveContext.target) {
-          const meta = await resolveLiveMetadata(flags.chat);
+          const meta = await resolveLiveMetadata(options.chat);
           context = {
             target: {
-              ...formatLiveMessage(liveContext.target, { channelId: String(flags.chat), ...meta }),
+              ...formatLiveMessage(liveContext.target, { channelId: String(options.chat), ...meta }),
               source: 'live',
             },
             before: liveContext.before.map((message) => ({
-              ...formatLiveMessage(message, { channelId: String(flags.chat), ...meta }),
+              ...formatLiveMessage(message, { channelId: String(options.chat), ...meta }),
               source: 'live',
             })),
             after: liveContext.after.map((message) => ({
-              ...formatLiveMessage(message, { channelId: String(flags.chat), ...meta }),
+              ...formatLiveMessage(message, { channelId: String(options.chat), ...meta }),
               source: 'live',
             })),
           };
@@ -1316,7 +1543,7 @@ async function runMessages(globalFlags, args) {
 
       if (!context && (resolvedSource === 'archive' || resolvedSource === 'both')) {
         const archiveContext = messageSyncService.getArchivedMessageContext({
-          channelId: flags.chat,
+          channelId: options.chat,
           messageId,
           before: safeBefore,
           after: safeAfter,
@@ -1341,10 +1568,6 @@ async function runMessages(globalFlags, args) {
       } else {
         console.log(JSON.stringify(payload, null, 2));
       }
-      return;
-    }
-
-    throw new Error(`Unknown messages subcommand: ${mode}`);
     } finally {
       await messageSyncService.shutdown();
       await telegramClient.destroy();
@@ -1353,78 +1576,31 @@ async function runMessages(globalFlags, args) {
   }, timeoutMs);
 }
 
-async function runSend(globalFlags, args) {
+async function runSendText(globalFlags, options = {}) {
   const timeoutMs = globalFlags.timeoutMs;
   return runWithTimeout(async () => {
-    const [mode, ...rest] = args;
-    if (!mode) {
-      throw new Error('send requires a subcommand: text | file');
+    if (!options.to) {
+      throw new Error('--to is required');
     }
-
+    if (!options.message) {
+      throw new Error('--message is required');
+    }
     const storeDir = resolveStoreDir();
     const release = acquireStoreLock(storeDir);
     const { telegramClient, messageSyncService } = createServices({ storeDir });
-
     try {
       if (!(await telegramClient.isAuthorized().catch(() => false))) {
         throw new Error('Not authenticated. Run `node cli.js auth` first.');
       }
+      const topicId = parsePositiveInt(options.topic, '--topic');
+      const result = await telegramClient.sendTextMessage(options.to, options.message, { topicId });
+      const payload = { channelId: options.to, ...result };
 
-      if (mode === 'text') {
-        const { flags } = parseFlags(rest, {
-          to: { type: 'string' },
-          message: { type: 'string' },
-          topic: { type: 'string' },
-        });
-        if (!flags.to) {
-          throw new Error('--to is required');
-        }
-        if (!flags.message) {
-          throw new Error('--message is required');
-        }
-        const topicId = parsePositiveInt(flags.topic, '--topic');
-        const result = await telegramClient.sendTextMessage(flags.to, flags.message, { topicId });
-        const payload = { channelId: flags.to, ...result };
-
-        if (globalFlags.json) {
-          writeJson(payload);
-        } else {
-          console.log(`Message sent (${result.messageId}).`);
-        }
-        return;
+      if (globalFlags.json) {
+        writeJson(payload);
+      } else {
+        console.log(`Message sent (${result.messageId}).`);
       }
-
-      if (mode === 'file') {
-        const { flags } = parseFlags(rest, {
-          to: { type: 'string' },
-          file: { type: 'string' },
-          caption: { type: 'string' },
-          filename: { type: 'string' },
-          topic: { type: 'string' },
-        });
-        if (!flags.to) {
-          throw new Error('--to is required');
-        }
-        if (!flags.file) {
-          throw new Error('--file is required');
-        }
-        const topicId = parsePositiveInt(flags.topic, '--topic');
-        const result = await telegramClient.sendFileMessage(flags.to, flags.file, {
-          caption: flags.caption,
-          filename: flags.filename,
-          topicId,
-        });
-        const payload = { channelId: flags.to, ...result };
-
-        if (globalFlags.json) {
-          writeJson(payload);
-        } else {
-          console.log(`File sent (${result.messageId}).`);
-        }
-        return;
-      }
-
-      throw new Error(`Unknown send subcommand: ${mode}`);
     } finally {
       await messageSyncService.shutdown();
       await telegramClient.destroy();
@@ -1433,29 +1609,53 @@ async function runSend(globalFlags, args) {
   }, timeoutMs);
 }
 
-async function runMedia(globalFlags, args) {
+async function runSendFile(globalFlags, options = {}) {
   const timeoutMs = globalFlags.timeoutMs;
   return runWithTimeout(async () => {
-    const [mode, ...rest] = args;
-    if (!mode) {
-      throw new Error('media requires a subcommand: download');
+    if (!options.to) {
+      throw new Error('--to is required');
     }
-    if (mode !== 'download') {
-      throw new Error(`Unknown media subcommand: ${mode}`);
+    if (!options.file) {
+      throw new Error('--file is required');
     }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    try {
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `node cli.js auth` first.');
+      }
+      const topicId = parsePositiveInt(options.topic, '--topic');
+      const result = await telegramClient.sendFileMessage(options.to, options.file, {
+        caption: options.caption,
+        filename: options.filename,
+        topicId,
+      });
+      const payload = { channelId: options.to, ...result };
 
-    const { flags } = parseFlags(rest, {
-      chat: { type: 'string' },
-      id: { type: 'string' },
-      output: { type: 'string' },
-    });
-    if (!flags.chat) {
+      if (globalFlags.json) {
+        writeJson(payload);
+      } else {
+        console.log(`File sent (${result.messageId}).`);
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runMediaDownload(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.chat) {
       throw new Error('--chat is required');
     }
-    if (!flags.id) {
+    if (!options.id) {
       throw new Error('--id is required');
     }
-    const messageId = parsePositiveInt(flags.id, '--id');
+    const messageId = parsePositiveInt(options.id, '--id');
 
     const storeDir = resolveStoreDir();
     const release = acquireStoreLock(storeDir);
@@ -1465,8 +1665,8 @@ async function runMedia(globalFlags, args) {
       if (!(await telegramClient.isAuthorized().catch(() => false))) {
         throw new Error('Not authenticated. Run `node cli.js auth` first.');
       }
-      const result = await telegramClient.downloadMessageMedia(flags.chat, messageId, {
-        outputPath: flags.output,
+      const result = await telegramClient.downloadMessageMedia(options.chat, messageId, {
+        outputPath: options.output,
       });
 
       if (globalFlags.json) {
@@ -1482,14 +1682,12 @@ async function runMedia(globalFlags, args) {
   }, timeoutMs);
 }
 
-async function runTopics(globalFlags, args) {
+async function runTopicsList(globalFlags, options = {}) {
   const timeoutMs = globalFlags.timeoutMs;
   return runWithTimeout(async () => {
-    const [mode, ...rest] = args;
-    if (!mode) {
-      throw new Error('topics requires a subcommand: list | search');
+    if (!options.chat) {
+      throw new Error('--chat is required');
     }
-
     const storeDir = resolveStoreDir();
     const release = acquireStoreLock(storeDir);
     const { telegramClient, messageSyncService } = createServices({ storeDir });
@@ -1498,59 +1696,17 @@ async function runTopics(globalFlags, args) {
       if (!(await telegramClient.isAuthorized().catch(() => false))) {
         throw new Error('Not authenticated. Run `node cli.js auth` first.');
       }
+      const limit = parsePositiveInt(options.limit, '--limit') ?? 100;
+      const topics = await telegramClient.listForumTopics(options.chat, { limit });
+      messageSyncService.upsertTopics(options.chat, topics);
 
-      if (mode === 'list') {
-        const { flags } = parseFlags(rest, {
-          chat: { type: 'string' },
-          limit: { type: 'string' },
-        });
-        if (!flags.chat) {
-          throw new Error('--chat is required');
+      if (globalFlags.json) {
+        writeJson({ total: topics.total ?? topics.length, topics });
+      } else {
+        for (const topic of topics) {
+          console.log(`#${topic.id} ${topic.title ?? ''}`.trim());
         }
-        const limit = parsePositiveInt(flags.limit, '--limit') ?? 100;
-        const topics = await telegramClient.listForumTopics(flags.chat, { limit });
-        messageSyncService.upsertTopics(flags.chat, topics);
-
-        if (globalFlags.json) {
-          writeJson({ total: topics.total ?? topics.length, topics });
-        } else {
-          for (const topic of topics) {
-            console.log(`#${topic.id} ${topic.title ?? ''}`.trim());
-          }
-        }
-        return;
       }
-
-      if (mode === 'search') {
-        const { flags } = parseFlags(rest, {
-          chat: { type: 'string' },
-          query: { type: 'string' },
-          limit: { type: 'string' },
-        });
-        if (!flags.chat) {
-          throw new Error('--chat is required');
-        }
-        if (!flags.query) {
-          throw new Error('--query is required');
-        }
-        const limit = parsePositiveInt(flags.limit, '--limit') ?? 100;
-        const topics = await telegramClient.listForumTopics(flags.chat, {
-          query: flags.query,
-          limit,
-        });
-        messageSyncService.upsertTopics(flags.chat, topics);
-
-        if (globalFlags.json) {
-          writeJson({ total: topics.total ?? topics.length, topics });
-        } else {
-          for (const topic of topics) {
-            console.log(`#${topic.id} ${topic.title ?? ''}`.trim());
-          }
-        }
-        return;
-      }
-
-      throw new Error(`Unknown topics subcommand: ${mode}`);
     } finally {
       await messageSyncService.shutdown();
       await telegramClient.destroy();
@@ -1559,119 +1715,201 @@ async function runTopics(globalFlags, args) {
   }, timeoutMs);
 }
 
-async function runTags(globalFlags, args) {
+async function runTopicsSearch(globalFlags, options = {}) {
   const timeoutMs = globalFlags.timeoutMs;
   return runWithTimeout(async () => {
-    const [mode, ...rest] = args;
-    if (!mode) {
-      throw new Error('tags requires a subcommand');
+    if (!options.chat) {
+      throw new Error('--chat is required');
     }
-
+    if (!options.query) {
+      throw new Error('--query is required');
+    }
     const storeDir = resolveStoreDir();
     const release = acquireStoreLock(storeDir);
     const { telegramClient, messageSyncService } = createServices({ storeDir });
 
     try {
-      if (mode === 'set') {
-        const { flags } = parseFlags(rest, {
-          chat: { type: 'string' },
-          tags: { type: 'string' },
-          tag: { type: 'string', multiple: true },
-          source: { type: 'string' },
-        });
-        if (!flags.chat) {
-          throw new Error('--chat is required');
-        }
-        const hasTagFlag = flags.tags !== undefined || flags.tag !== undefined;
-        const tagValues = [
-          ...parseListValues(flags.tags),
-          ...parseListValues(flags.tag),
-        ];
-        if (!hasTagFlag) {
-          throw new Error('--tags or --tag is required');
-        }
-        const finalTags = messageSyncService.setChannelTags(flags.chat, tagValues, {
-          source: flags.source,
-        });
-        if (globalFlags.json) {
-          writeJson({ channelId: flags.chat, tags: finalTags });
-        } else {
-          console.log(`Tags set for ${flags.chat}: ${finalTags.join(', ')}`);
-        }
-        return;
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `node cli.js auth` first.');
       }
+      const limit = parsePositiveInt(options.limit, '--limit') ?? 100;
+      const topics = await telegramClient.listForumTopics(options.chat, {
+        query: options.query,
+        limit,
+      });
+      messageSyncService.upsertTopics(options.chat, topics);
 
-      if (mode === 'list') {
-        const { flags } = parseFlags(rest, {
-          chat: { type: 'string' },
-          source: { type: 'string' },
-        });
-        if (!flags.chat) {
-          throw new Error('--chat is required');
+      if (globalFlags.json) {
+        writeJson({ total: topics.total ?? topics.length, topics });
+      } else {
+        for (const topic of topics) {
+          console.log(`#${topic.id} ${topic.title ?? ''}`.trim());
         }
-        const tags = messageSyncService.listChannelTags(flags.chat, { source: flags.source });
-        if (globalFlags.json) {
-          writeJson(tags);
-        } else {
-          console.log(tags.map((tag) => tag.tag).join(', '));
-        }
-        return;
       }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
 
-      if (mode === 'search') {
-        const { flags } = parseFlags(rest, {
-          tag: { type: 'string' },
-          source: { type: 'string' },
-          limit: { type: 'string' },
-        });
-        if (!flags.tag) {
-          throw new Error('--tag is required');
-        }
-        const limit = parsePositiveInt(flags.limit, '--limit') ?? 100;
-        const channels = messageSyncService.listTaggedChannels(flags.tag, {
-          source: flags.source,
-          limit,
-        });
-        if (globalFlags.json) {
-          writeJson(channels);
-        } else {
-          for (const channel of channels) {
-            const label = channel.peerTitle || channel.username || channel.channelId;
-            console.log(`${label} (${channel.channelId})`);
-          }
-        }
-        return;
+async function runTagsSet(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.chat) {
+      throw new Error('--chat is required');
+    }
+    const hasTagFlag = options.tags !== undefined || options.tag !== undefined;
+    const tagValues = [
+      ...parseListValues(options.tags),
+      ...parseListValues(options.tag),
+    ];
+    if (!hasTagFlag) {
+      throw new Error('--tags or --tag is required');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    try {
+      const finalTags = messageSyncService.setChannelTags(options.chat, tagValues, {
+        source: options.source,
+      });
+      if (globalFlags.json) {
+        writeJson({ channelId: options.chat, tags: finalTags });
+      } else {
+        console.log(`Tags set for ${options.chat}: ${finalTags.join(', ')}`);
       }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
 
-      if (mode === 'auto') {
-        const { flags } = parseFlags(rest, {
-          chat: { type: 'string', multiple: true },
-          limit: { type: 'string' },
-          source: { type: 'string' },
-          'no-refresh-metadata': { type: 'boolean' },
-        });
+async function runTagsList(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.chat) {
+      throw new Error('--chat is required');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    try {
+      const tags = messageSyncService.listChannelTags(options.chat, { source: options.source });
+      if (globalFlags.json) {
+        writeJson(tags);
+      } else {
+        console.log(tags.map((tag) => tag.tag).join(', '));
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runTagsSearch(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.tag) {
+      throw new Error('--tag is required');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    try {
+      const limit = parsePositiveInt(options.limit, '--limit') ?? 100;
+      const channels = messageSyncService.listTaggedChannels(options.tag, {
+        source: options.source,
+        limit,
+      });
+      if (globalFlags.json) {
+        writeJson(channels);
+      } else {
+        for (const channel of channels) {
+          const label = channel.peerTitle || channel.username || channel.channelId;
+          console.log(`${label} (${channel.channelId})`);
+        }
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runTagsAuto(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    try {
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `node cli.js auth` first.');
+      }
+      const channelIds = parseListValues(options.chat);
+      const limit = parsePositiveInt(options.limit, '--limit') ?? 50;
+      const results = await messageSyncService.autoTagChannels({
+        channelIds: channelIds.length ? channelIds : null,
+        limit,
+        source: options.source,
+        refreshMetadata: options.refreshMetadata !== false,
+      });
+      if (globalFlags.json) {
+        writeJson(results);
+      } else {
+        for (const entry of results) {
+          console.log(`${entry.channelId}: ${entry.tags.map((tag) => tag.tag).join(', ')}`);
+        }
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runMetadataGet(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.chat) {
+      throw new Error('--chat is required');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+
+    try {
+      let metadata = messageSyncService.getChannelMetadata(options.chat);
+      if (!metadata) {
         if (!(await telegramClient.isAuthorized().catch(() => false))) {
           throw new Error('Not authenticated. Run `node cli.js auth` first.');
         }
-        const channelIds = parseListValues(flags.chat);
-        const limit = parsePositiveInt(flags.limit, '--limit') ?? 50;
-        const results = await messageSyncService.autoTagChannels({
-          channelIds: channelIds.length ? channelIds : null,
-          limit,
-          source: flags.source,
-          refreshMetadata: !flags['no-refresh-metadata'],
-        });
-        if (globalFlags.json) {
-          writeJson(results);
-        } else {
-          for (const entry of results) {
-            console.log(`${entry.channelId}: ${entry.tags.map((tag) => tag.tag).join(', ')}`);
-          }
-        }
-        return;
+        const live = await telegramClient.getPeerMetadata(options.chat);
+        metadata = {
+          channelId: String(options.chat),
+          peerTitle: live?.peerTitle ?? null,
+          peerType: live?.peerType ?? null,
+          chatType: live?.chatType ?? null,
+          isForum: live?.isForum ?? null,
+          username: live?.username ?? null,
+          about: live?.about ?? null,
+          metadataUpdatedAt: null,
+          source: 'live',
+        };
       }
-
-      throw new Error(`Unknown tags subcommand: ${mode}`);
+      if (globalFlags.json) {
+        writeJson(metadata);
+      } else {
+        console.log(JSON.stringify(metadata, null, 2));
+      }
     } finally {
       await messageSyncService.shutdown();
       await telegramClient.destroy();
@@ -1680,79 +1918,30 @@ async function runTags(globalFlags, args) {
   }, timeoutMs);
 }
 
-async function runMetadata(globalFlags, args) {
+async function runMetadataRefresh(globalFlags, options = {}) {
   const timeoutMs = globalFlags.timeoutMs;
   return runWithTimeout(async () => {
-    const [mode, ...rest] = args;
-    if (!mode) {
-      throw new Error('metadata requires a subcommand');
-    }
-
     const storeDir = resolveStoreDir();
     const release = acquireStoreLock(storeDir);
     const { telegramClient, messageSyncService } = createServices({ storeDir });
 
     try {
-      if (mode === 'get') {
-        const { flags } = parseFlags(rest, {
-          chat: { type: 'string' },
-        });
-        if (!flags.chat) {
-          throw new Error('--chat is required');
-        }
-        let metadata = messageSyncService.getChannelMetadata(flags.chat);
-        if (!metadata) {
-          if (!(await telegramClient.isAuthorized().catch(() => false))) {
-            throw new Error('Not authenticated. Run `node cli.js auth` first.');
-          }
-          const live = await telegramClient.getPeerMetadata(flags.chat);
-          metadata = {
-            channelId: String(flags.chat),
-            peerTitle: live?.peerTitle ?? null,
-            peerType: live?.peerType ?? null,
-            chatType: live?.chatType ?? null,
-            isForum: live?.isForum ?? null,
-            username: live?.username ?? null,
-            about: live?.about ?? null,
-            metadataUpdatedAt: null,
-            source: 'live',
-          };
-        }
-        if (globalFlags.json) {
-          writeJson(metadata);
-        } else {
-          console.log(JSON.stringify(metadata, null, 2));
-        }
-        return;
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `node cli.js auth` first.');
       }
-
-      if (mode === 'refresh') {
-        const { flags } = parseFlags(rest, {
-          chat: { type: 'string', multiple: true },
-          limit: { type: 'string' },
-          force: { type: 'boolean' },
-          'only-missing': { type: 'boolean' },
-        });
-        if (!(await telegramClient.isAuthorized().catch(() => false))) {
-          throw new Error('Not authenticated. Run `node cli.js auth` first.');
-        }
-        const channelIds = parseListValues(flags.chat);
-        const limit = parsePositiveInt(flags.limit, '--limit') ?? 20;
-        const results = await messageSyncService.refreshChannelMetadata({
-          channelIds: channelIds.length ? channelIds : null,
-          limit,
-          force: Boolean(flags.force),
-          onlyMissing: Boolean(flags['only-missing']),
-        });
-        if (globalFlags.json) {
-          writeJson(results);
-        } else {
-          console.log(JSON.stringify(results, null, 2));
-        }
-        return;
+      const channelIds = parseListValues(options.chat);
+      const limit = parsePositiveInt(options.limit, '--limit') ?? 20;
+      const results = await messageSyncService.refreshChannelMetadata({
+        channelIds: channelIds.length ? channelIds : null,
+        limit,
+        force: Boolean(options.force),
+        onlyMissing: Boolean(options.onlyMissing),
+      });
+      if (globalFlags.json) {
+        writeJson(results);
+      } else {
+        console.log(JSON.stringify(results, null, 2));
       }
-
-      throw new Error(`Unknown metadata subcommand: ${mode}`);
     } finally {
       await messageSyncService.shutdown();
       await telegramClient.destroy();
@@ -1761,172 +1950,70 @@ async function runMetadata(globalFlags, args) {
   }, timeoutMs);
 }
 
-async function runContacts(globalFlags, args) {
+async function runContactsSearch(globalFlags, queryParts, options = {}) {
   const timeoutMs = globalFlags.timeoutMs;
   return runWithTimeout(async () => {
-    const [mode, ...rest] = args;
-    if (!mode) {
-      throw new Error('contacts requires a subcommand');
+    const query = (queryParts || []).join(' ').trim();
+    if (!query) {
+      throw new Error('search requires a query');
     }
-
     const storeDir = resolveStoreDir();
     const release = acquireStoreLock(storeDir);
     const { telegramClient, messageSyncService } = createServices({ storeDir });
 
     try {
-      if (mode === 'search') {
-        const { flags, rest: queryParts } = parseFlags(rest, {
-          limit: { type: 'string' },
-        });
-        const query = queryParts.join(' ').trim();
-        if (!query) {
-          throw new Error('search requires a query');
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `node cli.js auth` first.');
+      }
+      await messageSyncService.refreshContacts();
+      const contacts = messageSyncService.searchContacts(query, {
+        limit: parsePositiveInt(options.limit, '--limit') ?? 50,
+      });
+
+      if (globalFlags.json) {
+        writeJson(contacts);
+      } else {
+        for (const contact of contacts) {
+          const label = contact.alias || contact.displayName || contact.username || contact.userId;
+          console.log(`${label} (${contact.userId})`);
         }
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runContactsShow(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.user) {
+      throw new Error('--user is required');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+
+    try {
+      let contact = messageSyncService.getContact(options.user);
+      if (!contact) {
         if (!(await telegramClient.isAuthorized().catch(() => false))) {
           throw new Error('Not authenticated. Run `node cli.js auth` first.');
         }
         await messageSyncService.refreshContacts();
-        const contacts = messageSyncService.searchContacts(query, {
-          limit: parsePositiveInt(flags.limit, '--limit') ?? 50,
-        });
-
-        if (globalFlags.json) {
-          writeJson(contacts);
-        } else {
-          for (const contact of contacts) {
-            const label = contact.alias || contact.displayName || contact.username || contact.userId;
-            console.log(`${label} (${contact.userId})`);
-          }
-        }
-        return;
+        contact = messageSyncService.getContact(options.user);
+      }
+      if (!contact) {
+        throw new Error('Contact not found.');
       }
 
-      if (mode === 'show') {
-        const { flags } = parseFlags(rest, {
-          user: { type: 'string' },
-        });
-        if (!flags.user) {
-          throw new Error('--user is required');
-        }
-        let contact = messageSyncService.getContact(flags.user);
-        if (!contact) {
-          if (!(await telegramClient.isAuthorized().catch(() => false))) {
-            throw new Error('Not authenticated. Run `node cli.js auth` first.');
-          }
-          await messageSyncService.refreshContacts();
-          contact = messageSyncService.getContact(flags.user);
-        }
-        if (!contact) {
-          throw new Error('Contact not found.');
-        }
-
-        if (globalFlags.json) {
-          writeJson(contact);
-        } else {
-          console.log(JSON.stringify(contact, null, 2));
-        }
-        return;
+      if (globalFlags.json) {
+        writeJson(contact);
+      } else {
+        console.log(JSON.stringify(contact, null, 2));
       }
-
-      if (mode === 'alias') {
-        const [action, ...aliasArgs] = rest;
-        if (action === 'set') {
-          const { flags } = parseFlags(aliasArgs, {
-            user: { type: 'string' },
-            alias: { type: 'string' },
-          });
-          if (!flags.user) {
-            throw new Error('--user is required');
-          }
-          if (!flags.alias) {
-            throw new Error('--alias is required');
-          }
-          const alias = messageSyncService.setContactAlias(flags.user, flags.alias);
-          if (globalFlags.json) {
-            writeJson({ userId: flags.user, alias });
-          } else {
-            console.log(`Alias set for ${flags.user}: ${alias}`);
-          }
-          return;
-        }
-        if (action === 'rm') {
-          const { flags } = parseFlags(aliasArgs, {
-            user: { type: 'string' },
-          });
-          if (!flags.user) {
-            throw new Error('--user is required');
-          }
-          messageSyncService.removeContactAlias(flags.user);
-          if (globalFlags.json) {
-            writeJson({ userId: flags.user, removed: true });
-          } else {
-            console.log(`Alias removed for ${flags.user}`);
-          }
-          return;
-        }
-        throw new Error('contacts alias requires set | rm');
-      }
-
-      if (mode === 'tags') {
-        const [action, ...tagArgs] = rest;
-        const { flags } = parseFlags(tagArgs, {
-          user: { type: 'string' },
-          tag: { type: 'string', multiple: true },
-        });
-        if (!flags.user) {
-          throw new Error('--user is required');
-        }
-        const rawTags = Array.isArray(flags.tag) ? flags.tag : [];
-        const tags = rawTags.flatMap((entry) => entry.split(',').map((item) => item.trim()).filter(Boolean));
-        if (!tags.length) {
-          throw new Error('--tag is required');
-        }
-        if (action === 'add') {
-          const updated = messageSyncService.addContactTags(flags.user, tags);
-          if (globalFlags.json) {
-            writeJson({ userId: flags.user, tags: updated });
-          } else {
-            console.log(`Tags updated for ${flags.user}: ${updated.join(', ')}`);
-          }
-          return;
-        }
-        if (action === 'rm') {
-          const updated = messageSyncService.removeContactTags(flags.user, tags);
-          if (globalFlags.json) {
-            writeJson({ userId: flags.user, tags: updated });
-          } else {
-            console.log(`Tags updated for ${flags.user}: ${updated.join(', ')}`);
-          }
-          return;
-        }
-        throw new Error('contacts tags requires add | rm');
-      }
-
-      if (mode === 'notes') {
-        const [action, ...noteArgs] = rest;
-        if (action !== 'set') {
-          throw new Error('contacts notes requires set');
-        }
-        const { flags } = parseFlags(noteArgs, {
-          user: { type: 'string' },
-          notes: { type: 'string' },
-        });
-        if (!flags.user) {
-          throw new Error('--user is required');
-        }
-        if (flags.notes === undefined) {
-          throw new Error('--notes is required');
-        }
-        const notes = messageSyncService.setContactNotes(flags.user, flags.notes);
-        if (globalFlags.json) {
-          writeJson({ userId: flags.user, notes });
-        } else {
-          console.log(`Notes updated for ${flags.user}.`);
-        }
-        return;
-      }
-
-      throw new Error(`Unknown contacts subcommand: ${mode}`);
     } finally {
       await messageSyncService.shutdown();
       await telegramClient.destroy();
@@ -1935,14 +2022,148 @@ async function runContacts(globalFlags, args) {
   }, timeoutMs);
 }
 
-async function runGroups(globalFlags, args) {
+async function runContactsAliasSet(globalFlags, options = {}) {
   const timeoutMs = globalFlags.timeoutMs;
   return runWithTimeout(async () => {
-    const [mode, ...rest] = args;
-    if (!mode) {
-      throw new Error('groups requires a subcommand');
+    if (!options.user) {
+      throw new Error('--user is required');
     }
+    if (!options.alias) {
+      throw new Error('--alias is required');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
 
+    try {
+      const alias = messageSyncService.setContactAlias(options.user, options.alias);
+      if (globalFlags.json) {
+        writeJson({ userId: options.user, alias });
+      } else {
+        console.log(`Alias set for ${options.user}: ${alias}`);
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runContactsAliasRm(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.user) {
+      throw new Error('--user is required');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+
+    try {
+      messageSyncService.removeContactAlias(options.user);
+      if (globalFlags.json) {
+        writeJson({ userId: options.user, removed: true });
+      } else {
+        console.log(`Alias removed for ${options.user}`);
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runContactsTagsAdd(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.user) {
+      throw new Error('--user is required');
+    }
+    const tags = parseListValues(options.tag);
+    if (!tags.length) {
+      throw new Error('--tag is required');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+
+    try {
+      const updated = messageSyncService.addContactTags(options.user, tags);
+      if (globalFlags.json) {
+        writeJson({ userId: options.user, tags: updated });
+      } else {
+        console.log(`Tags updated for ${options.user}: ${updated.join(', ')}`);
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runContactsTagsRm(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.user) {
+      throw new Error('--user is required');
+    }
+    const tags = parseListValues(options.tag);
+    if (!tags.length) {
+      throw new Error('--tag is required');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+
+    try {
+      const updated = messageSyncService.removeContactTags(options.user, tags);
+      if (globalFlags.json) {
+        writeJson({ userId: options.user, tags: updated });
+      } else {
+        console.log(`Tags updated for ${options.user}: ${updated.join(', ')}`);
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runContactsNotesSet(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.user) {
+      throw new Error('--user is required');
+    }
+    if (options.notes === undefined) {
+      throw new Error('--notes is required');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+
+    try {
+      const notes = messageSyncService.setContactNotes(options.user, options.notes);
+      if (globalFlags.json) {
+        writeJson({ userId: options.user, notes });
+      } else {
+        console.log(`Notes updated for ${options.user}.`);
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runGroupsList(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
     const storeDir = resolveStoreDir();
     const release = acquireStoreLock(storeDir);
     const { telegramClient, messageSyncService } = createServices({ storeDir });
@@ -1951,178 +2172,267 @@ async function runGroups(globalFlags, args) {
       if (!(await telegramClient.isAuthorized().catch(() => false))) {
         throw new Error('Not authenticated. Run `node cli.js auth` first.');
       }
+      const groups = await telegramClient.listGroups({
+        query: options.query,
+        limit: parsePositiveInt(options.limit, '--limit') ?? 100,
+      });
 
-      if (mode === 'list') {
-        const { flags } = parseFlags(rest, {
-          query: { type: 'string' },
-          limit: { type: 'string' },
-        });
-        const groups = await telegramClient.listGroups({
-          query: flags.query,
-          limit: parsePositiveInt(flags.limit, '--limit') ?? 100,
-        });
-
-        if (globalFlags.json) {
-          writeJson(groups);
-        } else {
-          for (const group of groups) {
-            console.log(`${group.title} (${group.id})`);
-          }
+      if (globalFlags.json) {
+        writeJson(groups);
+      } else {
+        for (const group of groups) {
+          console.log(`${group.title} (${group.id})`);
         }
-        return;
       }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
 
-      if (mode === 'info') {
-        const { flags } = parseFlags(rest, {
-          chat: { type: 'string' },
-        });
-        if (!flags.chat) {
-          throw new Error('--chat is required');
-        }
-        const info = await telegramClient.getGroupInfo(flags.chat);
-        if (globalFlags.json) {
-          writeJson(info);
-        } else {
-          console.log(JSON.stringify(info, null, 2));
-        }
-        return;
+async function runGroupsInfo(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.chat) {
+      throw new Error('--chat is required');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+
+    try {
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `node cli.js auth` first.');
       }
-
-      if (mode === 'rename') {
-        const { flags } = parseFlags(rest, {
-          chat: { type: 'string' },
-          name: { type: 'string' },
-        });
-        if (!flags.chat) {
-          throw new Error('--chat is required');
-        }
-        if (!flags.name) {
-          throw new Error('--name is required');
-        }
-        await telegramClient.renameGroup(flags.chat, flags.name);
-        if (globalFlags.json) {
-          writeJson({ channelId: flags.chat, name: flags.name });
-        } else {
-          console.log(`Group renamed: ${flags.name}`);
-        }
-        return;
+      const info = await telegramClient.getGroupInfo(options.chat);
+      if (globalFlags.json) {
+        writeJson(info);
+      } else {
+        console.log(JSON.stringify(info, null, 2));
       }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
 
-      if (mode === 'members') {
-        const [action, ...memberArgs] = rest;
-        const { flags } = parseFlags(memberArgs, {
-          chat: { type: 'string' },
-          user: { type: 'string', multiple: true },
-        });
-        if (!flags.chat) {
-          throw new Error('--chat is required');
-        }
-        const users = Array.isArray(flags.user)
-          ? flags.user.flatMap((entry) => entry.split(',').map((item) => item.trim()).filter(Boolean))
-          : [];
-        if (!users.length) {
-          throw new Error('--user is required');
-        }
-        if (action === 'add') {
-          const failed = await telegramClient.addGroupMembers(flags.chat, users);
-          if (globalFlags.json) {
-            writeJson({ channelId: flags.chat, failed });
-          } else if (failed.length) {
-            console.log(`Some members failed: ${JSON.stringify(failed, null, 2)}`);
-          } else {
-            console.log('Members added.');
-          }
-          return;
-        }
-        if (action === 'remove') {
-          const result = await telegramClient.removeGroupMembers(flags.chat, users);
-          if (globalFlags.json) {
-            writeJson({ channelId: flags.chat, ...result });
-          } else {
-            console.log(`Removed: ${result.removed.join(', ')}`);
-            if (result.failed.length) {
-              console.log(`Failed: ${JSON.stringify(result.failed, null, 2)}`);
-            }
-          }
-          return;
-        }
-        throw new Error('groups members requires add | remove');
+async function runGroupsRename(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.chat) {
+      throw new Error('--chat is required');
+    }
+    if (!options.name) {
+      throw new Error('--name is required');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+
+    try {
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `node cli.js auth` first.');
       }
-
-      if (mode === 'invite') {
-        const [action, ...inviteArgs] = rest;
-        const { flags } = parseFlags(inviteArgs, {
-          chat: { type: 'string' },
-        });
-        if (!flags.chat) {
-          throw new Error('--chat is required');
-        }
-        if (action === 'link') {
-          const [linkAction] = inviteArgs.filter((arg) => !arg.startsWith('--'));
-          if (linkAction === 'get') {
-            const link = await telegramClient.getGroupInviteLink(flags.chat);
-            if (globalFlags.json) {
-              writeJson({ link: link.link });
-            } else {
-              console.log(link.link);
-            }
-            return;
-          }
-          if (linkAction === 'revoke') {
-            const existing = await telegramClient.getGroupInviteLink(flags.chat);
-            const link = await telegramClient.revokeGroupInviteLink(flags.chat, existing);
-            if (globalFlags.json) {
-              writeJson({ link: link.link });
-            } else {
-              console.log(link.link);
-            }
-            return;
-          }
-        }
-        throw new Error('groups invite requires link get|revoke');
+      await telegramClient.renameGroup(options.chat, options.name);
+      if (globalFlags.json) {
+        writeJson({ channelId: options.chat, name: options.name });
+      } else {
+        console.log(`Group renamed: ${options.name}`);
       }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
 
-      if (mode === 'join') {
-        const { flags } = parseFlags(rest, {
-          code: { type: 'string' },
-        });
-        if (!flags.code) {
-          throw new Error('--code is required');
-        }
-        const invite = normalizeInviteCode(flags.code);
-        if (!invite) {
-          throw new Error('Invalid invite code.');
-        }
-        const chat = await telegramClient.joinGroup(invite);
-        if (globalFlags.json) {
-          writeJson({
-            id: chat.id?.toString?.() ?? null,
-            title: chat.displayName || chat.title || 'Unknown',
-            username: chat.username ?? null,
-          });
-        } else {
-          console.log(`Joined: ${chat.displayName || chat.title || 'Unknown'}`);
-        }
-        return;
+async function runGroupMembersAdd(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.chat) {
+      throw new Error('--chat is required');
+    }
+    const users = parseListValues(options.user);
+    if (!users.length) {
+      throw new Error('--user is required');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+
+    try {
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `node cli.js auth` first.');
       }
-
-      if (mode === 'leave') {
-        const { flags } = parseFlags(rest, {
-          chat: { type: 'string' },
-        });
-        if (!flags.chat) {
-          throw new Error('--chat is required');
-        }
-        await telegramClient.leaveGroup(flags.chat);
-        if (globalFlags.json) {
-          writeJson({ channelId: flags.chat, left: true });
-        } else {
-          console.log(`Left ${flags.chat}`);
-        }
-        return;
+      const failed = await telegramClient.addGroupMembers(options.chat, users);
+      if (globalFlags.json) {
+        writeJson({ channelId: options.chat, failed });
+      } else if (failed.length) {
+        console.log(`Some members failed: ${JSON.stringify(failed, null, 2)}`);
+      } else {
+        console.log('Members added.');
       }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
 
-      throw new Error(`Unknown groups subcommand: ${mode}`);
+async function runGroupMembersRemove(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.chat) {
+      throw new Error('--chat is required');
+    }
+    const users = parseListValues(options.user);
+    if (!users.length) {
+      throw new Error('--user is required');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+
+    try {
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `node cli.js auth` first.');
+      }
+      const result = await telegramClient.removeGroupMembers(options.chat, users);
+      if (globalFlags.json) {
+        writeJson({ channelId: options.chat, ...result });
+      } else {
+        console.log(`Removed: ${result.removed.join(', ')}`);
+        if (result.failed.length) {
+          console.log(`Failed: ${JSON.stringify(result.failed, null, 2)}`);
+        }
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runGroupInviteLinkGet(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.chat) {
+      throw new Error('--chat is required');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+
+    try {
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `node cli.js auth` first.');
+      }
+      const link = await telegramClient.getGroupInviteLink(options.chat);
+      if (globalFlags.json) {
+        writeJson({ link: link.link });
+      } else {
+        console.log(link.link);
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runGroupInviteLinkRevoke(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.chat) {
+      throw new Error('--chat is required');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+
+    try {
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `node cli.js auth` first.');
+      }
+      const existing = await telegramClient.getGroupInviteLink(options.chat);
+      const link = await telegramClient.revokeGroupInviteLink(options.chat, existing);
+      if (globalFlags.json) {
+        writeJson({ link: link.link });
+      } else {
+        console.log(link.link);
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runGroupsJoin(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.code) {
+      throw new Error('--code is required');
+    }
+    const invite = normalizeInviteCode(options.code);
+    if (!invite) {
+      throw new Error('Invalid invite code.');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+
+    try {
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `node cli.js auth` first.');
+      }
+      const chat = await telegramClient.joinGroup(invite);
+      if (globalFlags.json) {
+        writeJson({
+          id: chat.id?.toString?.() ?? null,
+          title: chat.displayName || chat.title || 'Unknown',
+          username: chat.username ?? null,
+        });
+      } else {
+        console.log(`Joined: ${chat.displayName || chat.title || 'Unknown'}`);
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runGroupsLeave(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.chat) {
+      throw new Error('--chat is required');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+
+    try {
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `node cli.js auth` first.');
+      }
+      await telegramClient.leaveGroup(options.chat);
+      if (globalFlags.json) {
+        writeJson({ channelId: options.chat, left: true });
+      } else {
+        console.log(`Left ${options.chat}`);
+      }
     } finally {
       await messageSyncService.shutdown();
       await telegramClient.destroy();
@@ -2132,85 +2442,7 @@ async function runGroups(globalFlags, args) {
 }
 
 async function main() {
-  try {
-    const { flags: globalFlags, rest } = parseGlobalFlags(process.argv.slice(2));
-    globalFlags.timeoutMs = globalFlags.timeout ? parseDuration(globalFlags.timeout) : null;
-    if (globalFlags.version) {
-      console.log(readVersion());
-      return;
-    }
-    if (globalFlags.help || rest.length === 0) {
-      printUsage();
-      return;
-    }
-
-    const [command, ...args] = rest;
-    if (command === 'auth') {
-      await runAuth(globalFlags, args);
-      return;
-    }
-    if (command === 'sync') {
-      if (args[0] === 'status') {
-        await runSyncStatus(globalFlags);
-        return;
-      }
-      if (args[0] === 'jobs') {
-        await runSyncJobs(globalFlags, args.slice(1));
-        return;
-      }
-      await runSync(globalFlags, args);
-      return;
-    }
-    if (command === 'server') {
-      await runServer(globalFlags);
-      return;
-    }
-    if (command === 'doctor') {
-      await runDoctor(globalFlags, args);
-      return;
-    }
-    if (command === 'channels') {
-      await runChannels(globalFlags, args);
-      return;
-    }
-    if (command === 'messages') {
-      await runMessages(globalFlags, args);
-      return;
-    }
-    if (command === 'send') {
-      await runSend(globalFlags, args);
-      return;
-    }
-    if (command === 'media') {
-      await runMedia(globalFlags, args);
-      return;
-    }
-    if (command === 'topics') {
-      await runTopics(globalFlags, args);
-      return;
-    }
-    if (command === 'tags') {
-      await runTags(globalFlags, args);
-      return;
-    }
-    if (command === 'metadata') {
-      await runMetadata(globalFlags, args);
-      return;
-    }
-    if (command === 'contacts') {
-      await runContacts(globalFlags, args);
-      return;
-    }
-    if (command === 'groups') {
-      await runGroups(globalFlags, args);
-      return;
-    }
-
-    printUsage();
-  } catch (error) {
-    writeError(error, process.argv.includes('--json'));
-    process.exit(1);
-  }
+  await CLI_PROGRAM.parseAsync(process.argv);
 }
 
 await main();
