@@ -2003,10 +2003,9 @@ async function shutdown() {
   });
 }
 
-process.on("SIGINT", () => {
+const handleShutdownSignal = () => {
   void shutdown().finally(() => process.exit(0));
-});
+};
 
-process.on("SIGTERM", () => {
-  void shutdown().finally(() => process.exit(0));
-});
+process.prependListener("SIGINT", handleShutdownSignal);
+process.prependListener("SIGTERM", handleShutdownSignal);
