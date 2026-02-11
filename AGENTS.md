@@ -5,8 +5,8 @@
 - `telegram-client.js`: Domain logic for MTProto login, dialog traversal, and message helpers.
 - `client.js`: Example CLI harness for manual testing without the MCP layer.
 - `message-sync-service.js`: Background worker that archives messages into a local SQLite database.
-- `data/`: Runtime artifacts (SQLite session storage and message archive); keep out of version control but ensure the directory exists locally.
-- Documentation lives in `README.md` and `LIBRARY.md`; configuration relies on a local `.env` file.
+- Store location: OS app-data dir (tgcli store; override with `TGCLI_STORE`); keep runtime artifacts out of version control.
+- Documentation lives in `README.md` and `LIBRARY.md`; configuration relies on environment variables and the tgcli store.
 
 ## Build, Test, and Development Commands
 - `npm install`: Restore dependencies whenever `package-lock.json` changes.
@@ -31,4 +31,9 @@
 - Follow Conventional Commits (`type: subject`) as seen in `docs(readme): add detailed login guide...`; use lowercase types for routine changes and `fix:` for bug patches.
 - Keep commits atomic; include body details when altering session management or cache persistence.
 - PR descriptions should summarize intent, list manual verification (commands run, Telegram scenarios exercised), link related issues, and attach console excerpts when tool output changes.
-- Confirm no sensitive credentials or runtime artifacts from `data/` are committed before requesting review.
+- Confirm no sensitive credentials or runtime artifacts from the tgcli store are committed before requesting review.
+
+## Workflow
+- On startup, read `backlog.md` and pull tasks from it.
+- Thoroughly verify implemented functionality (tests, smoke runs, manual checks).
+- Commit verified features before starting the next task.

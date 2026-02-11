@@ -15,9 +15,6 @@ This library (`telegram-client.js`) enables programmatic interaction with Telegr
 ```javascript
 // Example using the client library (see client.js for a more complete example)
 import TelegramClient from "./telegram-client.js";
-import dotenv from "dotenv";
-
-dotenv.config();
 
 async function main() {
   // Create a new client instance
@@ -25,7 +22,7 @@ async function main() {
     process.env.TELEGRAM_API_ID,
     process.env.TELEGRAM_API_HASH,
     process.env.TELEGRAM_PHONE_NUMBER
-    // Optional: specify session path, default is './data/session.json'
+    // Optional: specify session path (default uses the tgcli store)
   );
 
   await client.initializeDialogCache();
@@ -63,7 +60,7 @@ const client = new TelegramClient(apiId, apiHash, phoneNumber, sessionPath);
 - `apiId`: Your Telegram API ID
 - `apiHash`: Your Telegram API Hash
 - `phoneNumber`: Your phone number in international format
-- `sessionPath`: (Optional) Path to save the session file (default: './data/session.json')
+- `sessionPath`: (Optional) Path to save the session file (default uses the tgcli store)
 
 #### Methods
 
@@ -72,6 +69,8 @@ const client = new TelegramClient(apiId, apiHash, phoneNumber, sessionPath);
 - `listDialogs(limit?)`: Returns the first `limit` dialogs as simple metadata objects.
 - `searchDialogs(keyword, limit?)`: Searches dialogs by title or username.
 - `ensureLogin()`: Throws if the client is not currently authorized.
-- `getMessagesByChannelId(channelId, limit)`: Returns `{ peerTitle, peerId, peerType, messages }` for the requested chat/channel.
+- `getMessagesByChannelId(channelId, limit)`: Returns `{ peerTitle, peerId, peerType, messages }` for the requested chat/channel (messages include `topic_id` when applicable).
+- `listForumTopics(channelId, options?)`: Returns forum topics for a supergroup (uses Telegram forum APIs).
+- `getTopicMessages(channelId, topicId, limit?)`: Returns `{ total, next, messages }` for a forum topic.
 - `filterMessagesByPattern(messages, pattern)`: Filters an array of message _strings_ by a regex pattern.
 - `destroy()`: Closes the underlying MTProto connection (useful for short-lived scripts).

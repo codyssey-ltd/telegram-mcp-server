@@ -1,20 +1,29 @@
 {
-  "name": "telegram-mcp-server",
-  "version": "1.0.0",
+  "name": "@kfastov/tgcli",
+  "version": "2.0.8",
   "type": "module",
-  "description": "MCP server scaffold for Telegram workflows using the official Model Context Protocol SDK",
+  "description": "Telegram CLI + MCP server powered by MTProto and the official MCP SDK",
   "main": "mcp-server.js",
   "scripts": {
     "client": "node mcp-client.js",
+    "cli": "node cli.js",
     "start": "node mcp-server.js",
     "prepare": "npm run build",
     "build": "echo \"No build step required\"",
     "prepublishOnly": "npm test",
     "test": "echo \"No tests specified yet\""
   },
+  "bin": {
+    "tgcli": "cli.js"
+  },
   "files": [
+    "cli.js",
+    "core",
+    "message-sync-service.js",
     "mcp-server.js",
+    "store-lock.js",
     "telegram-client.js",
+    "scripts/install-cli.sh",
     "LIBRARY.md",
     "README.md",
     "LICENSE"
@@ -42,10 +51,10 @@
   },
   "homepage": "https://github.com/kfastov/telegram-mcp-server#readme",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.9.0",
-    "@mtcute/core": "^0.26.1",
-    "@mtcute/node": "^0.26.1",
-    "better-sqlite3": "^9.6.0",
-    "dotenv": "^16.5.0"
+    "@modelcontextprotocol/sdk": "^1.25.2",
+    "@mtcute/core": "^0.27.8",
+    "@mtcute/node": "^0.27.8",
+    "better-sqlite3": "^12.6.0",
+    "commander": "^12.1.0"
   }
 }
